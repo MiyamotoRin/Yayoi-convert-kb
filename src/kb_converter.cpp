@@ -171,11 +171,25 @@ static bool find_eocd(const std::vector<uint8_t>& buf, size_t& eocd_offset) {
                                 : 0;
 
     // 末尾から前方向に走査 (YZ・PK 両形式に対応)
+    // 弥生バックアップは EOCD の後ろに独自メタデータを付加することがあるため、
+    // 末尾一致 (==) ではなくバッファ内に収まるか (<=) で検証する。
+    // 代わりに CDオフセット・CDシグネチャの整合性チェックで誤検知を防ぐ。
     for (size_t i = search_limit; ; --i) {
         if (has_zip_sig(buf, i, ZIP_EOCD_B2, ZIP_EOCD_B3)) {
-            // ZIPコメント長フィールドとファイル末尾が一致するか検証する
             uint16_t comment_len = read_le16(buf.data() + i + ZIP_EOCD_COMMENT_LEN);
-            if (i + ZIP_EOCD_FIXED_SIZE + comment_len == buf.size()) {
+            uint32_t cd_off  = read_le32(buf.data() + i + ZIP_EOCD_CD_OFFSET);
+            uint32_t cd_size = read_le32(buf.data() + i + ZIP_EOCD_CD_SIZE);
+
+            // コメントがバッファに収まるか
+            bool comment_ok = (i + ZIP_EOCD_FIXED_SIZE + comment_len <= buf.size());
+            // CDの位置がEOCDより前に収まるか
+            bool cd_pos_ok  = (cd_off <= i)
+                           && (static_cast<uint64_t>(cd_off) + cd_size <= i);
+            // CDの先頭シグネチャが正しいか (空CDは除く)
+            bool cd_sig_ok  = (cd_size == 0)
+                           || has_zip_sig(buf, cd_off, ZIP_CDIR_B2, ZIP_CDIR_B3);
+
+            if (comment_ok && cd_pos_ok && cd_sig_ok) {
                 eocd_offset = i;
                 return true;
             }
