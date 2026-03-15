@@ -13,12 +13,20 @@
 
 #include <iostream>
 #include <string>
-#include <filesystem>
 #ifdef _WIN32
 #  include <windows.h>
 #endif
 
-namespace fs = std::filesystem;
+#ifdef _WIN32
+/** UTF-16 wstring を UTF-8 std::string に変換する */
+static std::string wstring_to_utf8(const wchar_t* ws) {
+    if (!ws || ws[0] == L'\0') return {};
+    int len = WideCharToMultiByte(CP_UTF8, 0, ws, -1, nullptr, 0, nullptr, nullptr);
+    std::string result(static_cast<size_t>(len - 1), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, ws, -1, &result[0], len, nullptr, nullptr);
+    return result;
+}
+#endif
 
 static void print_usage(const char* prog) {
     std::cerr
@@ -37,28 +45,45 @@ static void print_usage(const char* prog) {
 }
 
 /**
- * 入力パスの拡張子を .KB26 に変えた出力パスを返す
+ * 入力パスの拡張子を .KB26 に変えた出力パスを返す。
+ * std::filesystem を一切使わず純粋な文字列操作で行う。
+ * (MinGW の std::filesystem はロケール変換時に日本語パスで例外を投げるため)
  */
 static std::string make_output_path(const std::string& input_path) {
-    // argv[] は UTF-8 (Git Bash / MSYS2) なので u8path で構築し、
-    // p.string() は Windows の ANSI コードページ変換で日本語パスが
-    // "Illegal byte sequence" になるため u8string() で返す。
-    fs::path p = fs::u8path(input_path);
-    p.replace_extension(".KB26");
-    return p.u8string();
+    size_t sep = input_path.find_last_of("/\\");
+    size_t dot = input_path.rfind('.');
+    if (dot != std::string::npos &&
+        (sep == std::string::npos || dot > sep)) {
+        return input_path.substr(0, dot) + ".KB26";
+    }
+    return input_path + ".KB26";
 }
 
 int main(int argc, char* argv[]) {
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
-#endif
+
+    // main(char* argv[]) は CP932 (ANSI) で引数を受け取るため、
+    // GetCommandLineW + CommandLineToArgvW で UTF-16 引数を直接取得する。
+    int wargc = 0;
+    LPWSTR* wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+    if (!wargv || wargc < 2) {
+        if (wargv) LocalFree(wargv);
+        print_usage(argv[0]);
+        return 1;
+    }
+    std::string input_path  = wstring_to_utf8(wargv[1]);
+    std::string output_path = (wargc >= 3) ? wstring_to_utf8(wargv[2])
+                                           : make_output_path(input_path);
+    LocalFree(wargv);
+#else
     if (argc < 2) {
         print_usage(argv[0]);
         return 1;
     }
-
     std::string input_path  = argv[1];
     std::string output_path = (argc >= 3) ? argv[2] : make_output_path(input_path);
+#endif
 
     std::cout << "入力ファイル : " << input_path  << "\n"
               << "出力ファイル : " << output_path << "\n"
