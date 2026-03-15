@@ -17,6 +17,17 @@
 #  include <windows.h>
 #endif
 
+#ifdef _WIN32
+/** UTF-16 wstring を UTF-8 std::string に変換する */
+static std::string wstring_to_utf8(const wchar_t* ws) {
+    if (!ws || ws[0] == L'\0') return {};
+    int len = WideCharToMultiByte(CP_UTF8, 0, ws, -1, nullptr, 0, nullptr, nullptr);
+    std::string result(static_cast<size_t>(len - 1), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, ws, -1, &result[0], len, nullptr, nullptr);
+    return result;
+}
+#endif
+
 static void print_usage(const char* prog) {
     std::cerr
         << "弥生会計バックアップ KB12→KB26 コンバータ\n"
@@ -51,14 +62,28 @@ static std::string make_output_path(const std::string& input_path) {
 int main(int argc, char* argv[]) {
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
-#endif
+
+    // main(char* argv[]) は CP932 (ANSI) で引数を受け取るため、
+    // GetCommandLineW + CommandLineToArgvW で UTF-16 引数を直接取得する。
+    int wargc = 0;
+    LPWSTR* wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+    if (!wargv || wargc < 2) {
+        if (wargv) LocalFree(wargv);
+        print_usage(argv[0]);
+        return 1;
+    }
+    std::string input_path  = wstring_to_utf8(wargv[1]);
+    std::string output_path = (wargc >= 3) ? wstring_to_utf8(wargv[2])
+                                           : make_output_path(input_path);
+    LocalFree(wargv);
+#else
     if (argc < 2) {
         print_usage(argv[0]);
         return 1;
     }
-
     std::string input_path  = argv[1];
     std::string output_path = (argc >= 3) ? argv[2] : make_output_path(input_path);
+#endif
 
     std::cout << "入力ファイル : " << input_path  << "\n"
               << "出力ファイル : " << output_path << "\n"
