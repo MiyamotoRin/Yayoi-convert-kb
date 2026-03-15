@@ -14,6 +14,9 @@
 #include <iostream>
 #include <string>
 #include <filesystem>
+#ifdef _WIN32
+#  include <windows.h>
+#endif
 
 namespace fs = std::filesystem;
 
@@ -44,6 +47,9 @@ static std::string make_output_path(const std::string& input_path) {
 }
 
 int main(int argc, char* argv[]) {
+#ifdef _WIN32
+    SetConsoleOutputCP(CP_UTF8);
+#endif
     if (argc < 2) {
         print_usage(argv[0]);
         return 1;
