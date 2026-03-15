@@ -38,10 +38,26 @@
 #include <cstring>
 #include <algorithm>
 #include <cctype>
+#ifdef _WIN32
+#  include <windows.h>
+#endif
 
 // ─────────────────────────────────────────────
 // ユーティリティ
 // ─────────────────────────────────────────────
+
+#ifdef _WIN32
+/** UTF-8 文字列を Windows ネイティブの wstring に変換する */
+static std::wstring utf8_to_wstring(const std::string& utf8) {
+    if (utf8.empty()) return {};
+    int len = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(),
+                                  static_cast<int>(utf8.size()), nullptr, 0);
+    std::wstring result(static_cast<size_t>(len), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(),
+                        static_cast<int>(utf8.size()), &result[0], len);
+    return result;
+}
+#endif
 
 static inline uint16_t read_le16(const uint8_t* p) {
     return static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
@@ -55,7 +71,12 @@ static inline uint32_t read_le32(const uint8_t* p) {
 }
 
 static bool read_file(const std::string& path, std::vector<uint8_t>& buf) {
+    // Windows では日本語パスが ANSI として解釈されるため wstring 版を使用する
+#ifdef _WIN32
+    std::ifstream ifs(utf8_to_wstring(path), std::ios::binary | std::ios::ate);
+#else
     std::ifstream ifs(path, std::ios::binary | std::ios::ate);
+#endif
     if (!ifs) return false;
     std::streamsize size = ifs.tellg();
     if (size <= 0) return false;
@@ -65,7 +86,11 @@ static bool read_file(const std::string& path, std::vector<uint8_t>& buf) {
 }
 
 static bool write_file(const std::string& path, const std::vector<uint8_t>& buf) {
+#ifdef _WIN32
+    std::ofstream ofs(utf8_to_wstring(path), std::ios::binary | std::ios::trunc);
+#else
     std::ofstream ofs(path, std::ios::binary | std::ios::trunc);
+#endif
     if (!ofs) return false;
     return static_cast<bool>(ofs.write(reinterpret_cast<const char*>(buf.data()),
                                        static_cast<std::streamsize>(buf.size())));
@@ -249,7 +274,11 @@ ConvertResult convert_kb12_to_kb26(
 
     std::vector<uint8_t> buf;
     if (!read_file(input_path, buf)) {
+#ifdef _WIN32
+        std::ifstream test(utf8_to_wstring(input_path));
+#else
         std::ifstream test(input_path);
+#endif
         return test ? ConvertResult::ERR_INPUT_READ_FAILED
                     : ConvertResult::ERR_INPUT_NOT_FOUND;
     }
@@ -365,7 +394,11 @@ bool validate_kb12_file(const std::string& file_path, std::string* error_msg) {
 
     std::vector<uint8_t> buf;
     if (!read_file(file_path, buf)) {
+#ifdef _WIN32
+        std::ifstream test(utf8_to_wstring(file_path));
+#else
         std::ifstream test(file_path);
+#endif
         return test ? set_err("ファイルの読み込みに失敗しました")
                     : set_err("ファイルが見つかりません: " + file_path);
     }
