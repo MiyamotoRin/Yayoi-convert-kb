@@ -53,24 +53,62 @@ static constexpr uint8_t ZIP_EOCD_B3    = 0x06;
 
 // ─────────────────────────────────────────────
 // ZIPローカルファイルヘッダ フィールドオフセット (先頭4バイト込み)
+//
+// 注意: 弥生形式は標準ZIPと異なり compressed_size・uncompressed_size を
+//       int64 (8バイト) で格納する。そのため後続フィールドのオフセットが
+//       標準ZIP (4バイト×2=8バイト) より +8 ずれる。
+//
+//   標準ZIP LFH 固定部 (30バイト):
+//     +18: compressed_size   (4バイト)
+//     +22: uncompressed_size (4バイト)
+//     +26: name_len          (2バイト)
+//     +28: extra_len         (2バイト)
+//
+//   弥生 LFH 固定部 (38バイト):
+//     +18: compressed_size   (8バイト / int64)
+//     +26: uncompressed_size (8バイト / int64)
+//     +34: name_len          (2バイト)
+//     +36: extra_len         (2バイト)
 // ─────────────────────────────────────────────
 static constexpr size_t ZIP_LFH_FLAGS            = 6;   // 汎用ビットフラグ (2バイト)
 static constexpr size_t ZIP_LFH_COMPRESSION      = 8;   // 圧縮方式 (2バイト)
 static constexpr size_t ZIP_LFH_CRC32            = 14;  // CRC-32 (4バイト)
-static constexpr size_t ZIP_LFH_COMPRESSED_SIZE  = 18;  // 圧縮後サイズ (4バイト)
-static constexpr size_t ZIP_LFH_FILENAME_LEN     = 26;  // ファイル名長 (2バイト)
-static constexpr size_t ZIP_LFH_EXTRA_LEN        = 28;  // 拡張フィールド長 (2バイト)
-static constexpr size_t ZIP_LFH_FIXED_SIZE       = 30;  // ファイル名以前の固定部分
+static constexpr size_t ZIP_LFH_COMPRESSED_SIZE  = 18;  // 圧縮後サイズ (8バイト / int64)
+static constexpr size_t ZIP_LFH_UNCOMPRESSED_SIZE= 26;  // 展開後サイズ (8バイト / int64)
+static constexpr size_t ZIP_LFH_FILENAME_LEN     = 34;  // ファイル名長 (2バイト)
+static constexpr size_t ZIP_LFH_EXTRA_LEN        = 36;  // 拡張フィールド長 (2バイト)
+static constexpr size_t ZIP_LFH_FIXED_SIZE       = 38;  // ファイル名以前の固定部分
 
 // ─────────────────────────────────────────────
 // ZIPセントラルディレクトリエントリ フィールドオフセット (先頭4バイト込み)
+//
+// 注意: 弥生形式は compressed_size・uncompressed_size・local_off を
+//       int64 (8バイト) で格納する。後続フィールドのオフセットが
+//       標準ZIP (4+4+4=12バイト) より +12 ずれる。
+//
+//   標準ZIP CDE 固定部 (46バイト):
+//     +20: compressed_size   (4バイト)
+//     +24: uncompressed_size (4バイト)
+//     +28: name_len          (2バイト)
+//     +30: extra_len         (2バイト)
+//     +32: comment_len       (2バイト)
+//     +42: local_off         (4バイト)
+//
+//   弥生 CDE 固定部 (58バイト):
+//     +20: compressed_size   (8バイト / int64)
+//     +28: uncompressed_size (8バイト / int64)
+//     +36: name_len          (2バイト)
+//     +38: extra_len         (2バイト)
+//     +40: comment_len       (2バイト)
+//     +50: local_off         (8バイト / int64, uint32 読み取りで動作)
 // ─────────────────────────────────────────────
-static constexpr size_t ZIP_CDE_COMPRESSED_SIZE  = 20;  // 圧縮後サイズ (4バイト)
-static constexpr size_t ZIP_CDE_FILENAME_LEN     = 28;  // ファイル名長 (2バイト)
-static constexpr size_t ZIP_CDE_EXTRA_LEN        = 30;  // 拡張フィールド長 (2バイト)
-static constexpr size_t ZIP_CDE_COMMENT_LEN      = 32;  // コメント長 (2バイト)
-static constexpr size_t ZIP_CDE_LOCAL_OFFSET     = 42;  // ローカルヘッダ位置 (4バイト)
-static constexpr size_t ZIP_CDE_FIXED_SIZE       = 46;  // ファイル名以前の固定部分
+static constexpr size_t ZIP_CDE_COMPRESSED_SIZE  = 20;  // 圧縮後サイズ (8バイト / int64)
+static constexpr size_t ZIP_CDE_UNCOMPRESSED_SIZE= 28;  // 展開後サイズ (8バイト / int64)
+static constexpr size_t ZIP_CDE_FILENAME_LEN     = 36;  // ファイル名長 (2バイト)
+static constexpr size_t ZIP_CDE_EXTRA_LEN        = 38;  // 拡張フィールド長 (2バイト)
+static constexpr size_t ZIP_CDE_COMMENT_LEN      = 40;  // コメント長 (2バイト)
+static constexpr size_t ZIP_CDE_LOCAL_OFFSET     = 50;  // ローカルヘッダ位置 (8バイト / int64)
+static constexpr size_t ZIP_CDE_FIXED_SIZE       = 58;  // ファイル名以前の固定部分
 
 // ─────────────────────────────────────────────
 // ZIPエンドオブセントラルディレクトリ フィールドオフセット (先頭4バイト込み)

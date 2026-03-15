@@ -604,7 +604,6 @@ void diagnose_kb_file(const std::string& file_path) {
                 uint16_t comment_len = (i + ZIP_EOCD_COMMENT_LEN + 1 < buf.size())
                     ? read_le16(buf.data() + i + ZIP_EOCD_COMMENT_LEN) : 0xFFFF;
                 size_t expected_end = i + ZIP_EOCD_FIXED_SIZE + comment_len;
-                bool valid = (expected_end == buf.size());
 
                 std::cout << es.label << " EOCD at offset 0x"
                           << std::hex << std::uppercase << i
@@ -612,8 +611,11 @@ void diagnose_kb_file(const std::string& file_path) {
                 std::cout << "  comment_len フィールド = " << comment_len << "\n";
                 std::cout << "  期待するファイル末尾位置 = "
                           << expected_end << " (実際 = " << buf.size() << ")\n";
-                std::cout << "  検証: " << (valid ? "OK (有効)" : "NG (末尾と不一致)") << "\n";
-                if (!valid) {
+                // 弥生形式は EOCD の後ろに独自メタデータを付加するため末尾一致しない場合がある。
+                // 代わりに CD整合性 (cd_off + cd_size == EOCD offset) で有効性を判定する。
+                bool end_match = (expected_end == buf.size());
+                std::cout << "  末尾一致: " << (end_match ? "OK" : "NG (弥生形式の後付けメタデータの可能性あり)") << "\n";
+                if (!end_match) {
                     std::cout << "  ずれ = "
                               << static_cast<long long>(expected_end)
                                  - static_cast<long long>(buf.size())
@@ -633,6 +635,10 @@ void diagnose_kb_file(const std::string& file_path) {
                               << " エントリ(合計)=" << cd_entries_total << "\n";
                     std::cout << "  CDサイズ=0x" << std::hex << cd_size
                               << " CDオフセット=0x" << cd_offset << "\n" << std::dec;
+                    // CD整合性: cd_offset + cd_size == EOCD offset なら有効
+                    bool cd_ok = (static_cast<uint64_t>(cd_offset) + cd_size == i);
+                    std::cout << "  CD整合性 (CDオフセット+CDサイズ==EOCD位置): "
+                              << (cd_ok ? "OK (有効)" : "NG") << "\n";
 
                     // CD 領域のダンプ
                     if (cd_offset < buf.size() && cd_size > 0) {
@@ -664,9 +670,9 @@ void diagnose_kb_file(const std::string& file_path) {
                                       << " comment_len=" << cmt_len2
                                       << " local_offset=0x" << std::hex << local_off2
                                       << std::dec << "\n";
-                            std::cout << "  fixed(46) + name_len = " << (46 + name_len2)
+                            std::cout << "  fixed(" << ZIP_CDE_FIXED_SIZE << ") + name_len = " << (ZIP_CDE_FIXED_SIZE + name_len2)
                                       << " / CD全体 = " << cd_size
-                                      << " → " << ((static_cast<uint32_t>(46 + name_len2) <= cd_size) ? "OK" : "NG (name_len が CD サイズを超えている)") << "\n";
+                                      << " → " << ((ZIP_CDE_FIXED_SIZE + name_len2 <= cd_size) ? "OK" : "NG (name_len が CD サイズを超えている)") << "\n";
 
                             // ファイル名バイト列
                             if (pos + ZIP_CDE_FIXED_SIZE + name_len2 <= buf.size()) {
