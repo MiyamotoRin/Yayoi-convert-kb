@@ -14,12 +14,37 @@
 
 ### CMake を使う場合 (推奨)
 
+#### Linux / macOS
+
 ```bash
 cmake -B build
 cmake --build build
 ```
 
-生成された実行ファイルは `build/kb_converter` (Windows では `build/kb_converter.exe`) です。
+#### Windows — Visual Studio を使う場合
+
+Visual Studio 2017 以降と「C++ によるデスクトップ開発」ワークロードがインストールされている場合:
+
+```powershell
+cmake -B build
+cmake --build build --config Release
+```
+
+#### Windows — MinGW (MSYS2) を使う場合
+
+[MSYS2](https://www.msys2.org/) をインストールして `mingw-w64-x86_64-gcc` と `mingw-w64-x86_64-cmake` を導入済みの場合は、MSYS2 MinGW 64-bit シェルで:
+
+```bash
+cmake -B build -G "MinGW Makefiles"
+cmake --build build
+```
+
+> **Visual Studio も MinGW も入っていない場合**
+> CMake は既定のジェネレータとして NMake を試みますが、Visual Studio Build Tools がないと
+> `'nmake' '-?' failed with: no such file or directory` というエラーになります。
+> 上記いずれかの C++ コンパイラをインストールしてから再実行してください。
+
+生成された実行ファイルは `build/kb_converter` (Windows では `build/Release/kb_converter.exe` または `build/kb_converter.exe`) です。
 
 ### make を使う場合
 
@@ -44,6 +69,15 @@ make
 ### Windows
 
 [cmake.org/download/](https://cmake.org/download/) から `.msi` インストーラをダウンロードして実行してください。
+
+CMake だけでなく **C++ コンパイラ** も必要です。以下のいずれかをインストールしてください:
+
+- **Visual Studio 2017 以降**: インストーラで「C++ によるデスクトップ開発」ワークロードを選択
+  - Build Tools のみでよい場合は [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) (無償) をインストール
+- **MinGW-w64**: [MSYS2](https://www.msys2.org/) 経由でインストール
+  ```bash
+  pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake
+  ```
 
 ### macOS
 
