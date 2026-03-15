@@ -412,6 +412,24 @@ ConvertResult convert_kb12_to_kb26(
         }
     }
 
+    // 5d. EOCD後の弥生独自メタデータ内の ".KD12" を ".KD26" に更新
+    //     末尾736バイト領域にはエントリ名が複数箇所コピーされており、
+    //     ここに ".KD12" が残っていると復元後の読み込みで失敗する。
+    //     "12" を含む他のデータ (日付 "12/31" 等) を誤って書き換えないよう
+    //     ".KD12" (2E 4B 44 31 32) のみを対象にする。
+    {
+        static constexpr uint8_t kd12[] = {0x2E, 0x4B, 0x44, 0x31, 0x32};  // ".KD12"
+        static constexpr uint8_t kd26[] = {0x2E, 0x4B, 0x44, 0x32, 0x36};  // ".KD26"
+        size_t trailing_start = eocd_offset + ZIP_EOCD_FIXED_SIZE + zip_comment_len;
+        for (size_t i = trailing_start; i + 5 <= buf.size(); ++i) {
+            if (std::memcmp(buf.data() + i, kd12, 5) == 0) {
+                std::memcpy(buf.data() + i, kd26, 5);
+                any_patched = true;
+                notify("  後付けメタデータ内バージョンを更新 (offset=" + std::to_string(i) + ")", -1);
+            }
+        }
+    }
+
     if (!any_patched) {
         // バージョン文字列が見つからなかった場合
         // 圧縮データ内に格納されている可能性があるため調査が必要
