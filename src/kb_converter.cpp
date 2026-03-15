@@ -73,7 +73,7 @@ static inline uint32_t read_le32(const uint8_t* p) {
 static bool read_file(const std::string& path, std::vector<uint8_t>& buf) {
     // Windows では日本語パスが ANSI として解釈されるため wstring 版を使用する
 #ifdef _WIN32
-    std::ifstream ifs(utf8_to_wstring(path), std::ios::binary | std::ios::ate);
+    std::ifstream ifs(utf8_to_wstring(path).c_str(), std::ios::binary | std::ios::ate);
 #else
     std::ifstream ifs(path, std::ios::binary | std::ios::ate);
 #endif
@@ -87,7 +87,7 @@ static bool read_file(const std::string& path, std::vector<uint8_t>& buf) {
 
 static bool write_file(const std::string& path, const std::vector<uint8_t>& buf) {
 #ifdef _WIN32
-    std::ofstream ofs(utf8_to_wstring(path), std::ios::binary | std::ios::trunc);
+    std::ofstream ofs(utf8_to_wstring(path).c_str(), std::ios::binary | std::ios::trunc);
 #else
     std::ofstream ofs(path, std::ios::binary | std::ios::trunc);
 #endif
@@ -275,7 +275,7 @@ ConvertResult convert_kb12_to_kb26(
     std::vector<uint8_t> buf;
     if (!read_file(input_path, buf)) {
 #ifdef _WIN32
-        std::ifstream test(utf8_to_wstring(input_path));
+        std::ifstream test(utf8_to_wstring(input_path).c_str());
 #else
         std::ifstream test(input_path);
 #endif
@@ -395,7 +395,7 @@ bool validate_kb12_file(const std::string& file_path, std::string* error_msg) {
     std::vector<uint8_t> buf;
     if (!read_file(file_path, buf)) {
 #ifdef _WIN32
-        std::ifstream test(utf8_to_wstring(file_path));
+        std::ifstream test(utf8_to_wstring(file_path).c_str());
 #else
         std::ifstream test(file_path);
 #endif
