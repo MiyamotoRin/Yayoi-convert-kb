@@ -633,6 +633,62 @@ void diagnose_kb_file(const std::string& file_path) {
                               << " エントリ(合計)=" << cd_entries_total << "\n";
                     std::cout << "  CDサイズ=0x" << std::hex << cd_size
                               << " CDオフセット=0x" << cd_offset << "\n" << std::dec;
+
+                    // CD 領域のダンプ
+                    if (cd_offset < buf.size() && cd_size > 0) {
+                        size_t dump_len = std::min<size_t>(cd_size, buf.size() - cd_offset);
+                        print_hex_region(buf, cd_offset, dump_len,
+                                         "  セントラルディレクトリ 全体");
+
+                        // CDE フィールド解析 (先頭エントリのみ)
+                        size_t pos = cd_offset;
+                        if (pos + ZIP_CDE_FIXED_SIZE <= cd_offset + cd_size
+                         && pos + ZIP_CDE_FIXED_SIZE <= buf.size()) {
+                            std::cout << "\n  [CDE フィールド解析 (先頭エントリ)]\n";
+                            std::cout << "  シグネチャ : "
+                                      << hex_dump(buf.data() + pos, 4) << "\n";
+                            uint16_t ver_made   = read_le16(buf.data() + pos + 4);
+                            uint16_t ver_need   = read_le16(buf.data() + pos + 6);
+                            uint16_t flags      = read_le16(buf.data() + pos + 8);
+                            uint16_t method     = read_le16(buf.data() + pos + 10);
+                            uint16_t name_len2  = read_le16(buf.data() + pos + ZIP_CDE_FILENAME_LEN);
+                            uint16_t extra_len2 = read_le16(buf.data() + pos + ZIP_CDE_EXTRA_LEN);
+                            uint16_t cmt_len2   = read_le16(buf.data() + pos + ZIP_CDE_COMMENT_LEN);
+                            uint32_t local_off2 = read_le32(buf.data() + pos + ZIP_CDE_LOCAL_OFFSET);
+                            std::cout << "  ver_made=" << ver_made
+                                      << " ver_need=" << ver_need
+                                      << " flags=0x" << std::hex << flags
+                                      << " method=" << std::dec << method << "\n";
+                            std::cout << "  name_len=" << name_len2
+                                      << " extra_len=" << extra_len2
+                                      << " comment_len=" << cmt_len2
+                                      << " local_offset=0x" << std::hex << local_off2
+                                      << std::dec << "\n";
+                            std::cout << "  fixed(46) + name_len = " << (46 + name_len2)
+                                      << " / CD全体 = " << cd_size
+                                      << " → " << ((static_cast<uint32_t>(46 + name_len2) <= cd_size) ? "OK" : "NG (name_len が CD サイズを超えている)") << "\n";
+
+                            // ファイル名バイト列
+                            if (pos + ZIP_CDE_FIXED_SIZE + name_len2 <= buf.size()) {
+                                std::string raw_name(
+                                    reinterpret_cast<const char*>(buf.data() + pos + ZIP_CDE_FIXED_SIZE),
+                                    name_len2);
+                                std::cout << "  ファイル名 (raw hex): "
+                                          << hex_dump(buf.data() + pos + ZIP_CDE_FIXED_SIZE,
+                                                      name_len2) << "\n";
+                                std::cout << "  ファイル名 (ASCII): ";
+                                for (char c : raw_name) std::cout << to_printable(static_cast<uint8_t>(c));
+                                std::cout << "\n";
+                            }
+
+                            // LFH のダンプ
+                            if (local_off2 + ZIP_LFH_FIXED_SIZE <= buf.size()) {
+                                print_hex_region(buf, local_off2,
+                                                 std::min<size_t>(64, buf.size() - local_off2),
+                                                 "  ローカルファイルヘッダ (先頭 64 バイト)");
+                            }
+                        }
+                    }
                 }
                 std::cout << "\n";
             }
