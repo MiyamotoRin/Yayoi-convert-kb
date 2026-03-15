@@ -40,12 +40,10 @@ static void print_usage(const char* prog) {
  * 入力パスの拡張子を .KB26 に変えた出力パスを返す
  */
 static std::string make_output_path(const std::string& input_path) {
-    // argv[] は UTF-8 (Git Bash / MSYS2) なので u8path で構築し、
-    // p.string() は Windows の ANSI コードページ変換で日本語パスが
-    // "Illegal byte sequence" になるため u8string() で返す。
-    fs::path p = fs::u8path(input_path);
+    fs::path p(input_path);
+    // 拡張子を大文字小文字問わず置換
     p.replace_extension(".KB26");
-    return p.u8string();
+    return p.string();
 }
 
 int main(int argc, char* argv[]) {
