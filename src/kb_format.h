@@ -2,93 +2,91 @@
  * kb_format.h
  * 弥生会計バックアップファイル (.KB12 / .KB26) フォーマット定義
  *
- * 弥生会計のバックアップファイルは以下の構造を持つ:
- *   - ファイルシグネチャ (マジックバイト)
- *   - バージョン情報ヘッダ
- *   - メタデータブロック (会社名, 年度, 作成日時など)
- *   - データブロック (ZLIB圧縮)
- *   - チェックサム (末尾4バイト CRC32)
+ * 実際のファイル構造 (実ファイルのバイナリ解析により判明):
+ *   弥生会計のバックアップファイルは変形ZIPアーカイブ形式を使用する。
+ *   標準ZIPの署名 "PK" (0x50 0x4B) がすべて "YZ" (0x59 0x5A) に
+ *   置き換えられている以外は標準ZIPと同一の構造を持つ。
+ *
+ *   先頭バイト列の実測値 (2ファイル共通):
+ *     59 5A 03 04 14 00 00 00 08 00 ...
+ *      Y  Z  [ZIPローカルファイルヘッダ後半]  [ver=20] [flags=0] [deflate]
+ *   標準ZIPとの比較:
+ *     50 4B 03 04 14 00 00 00 08 00 ...
+ *      P  K
+ *
+ * バージョン情報の格納場所 (要調査):
+ *   ZIPエントリのファイル名・ZIPコメントにバージョン文字列が含まれる可能性がある。
+ *   圧縮データ内に格納されている場合は解凍・再圧縮が必要になる。
  */
 #pragma once
 
 #include <cstdint>
-#include <cstring>
 #include <array>
 
-// ファイルシグネチャ (先頭4バイト)
-// 弥生会計バックアップの共通マジックバイト
-static constexpr std::array<uint8_t, 4> YAYOI_MAGIC = { 0x59, 0x41, 0x59, 0x4F }; // "YAYO"
+// ─────────────────────────────────────────────
+// 弥生バックアップ固有のシグネチャ
+// ─────────────────────────────────────────────
 
-// バージョン定数
-static constexpr uint16_t KB_VERSION_12 = 0x000C; // バージョン12
-static constexpr uint16_t KB_VERSION_19 = 0x0013; // バージョン19
-static constexpr uint16_t KB_VERSION_24 = 0x0018; // バージョン24
-static constexpr uint16_t KB_VERSION_26 = 0x001A; // バージョン26
-
-// ヘッダオフセット定数
-static constexpr size_t OFFSET_MAGIC         = 0;    // マジックバイト (4バイト)
-static constexpr size_t OFFSET_FILE_VERSION  = 4;    // ファイルフォーマットバージョン (2バイト, LE)
-static constexpr size_t OFFSET_APP_VERSION   = 6;    // アプリバージョン (2バイト, LE)
-static constexpr size_t OFFSET_FLAGS         = 8;    // フラグ (4バイト)
-static constexpr size_t OFFSET_HEADER_SIZE   = 12;   // ヘッダサイズ (4バイト, LE)
-static constexpr size_t OFFSET_DATA_OFFSET   = 16;   // データブロック開始オフセット (4バイト, LE)
-static constexpr size_t OFFSET_DATA_SIZE     = 20;   // 圧縮データサイズ (4バイト, LE)
-static constexpr size_t OFFSET_ORIG_SIZE     = 24;   // 元データサイズ (4バイト, LE)
-static constexpr size_t OFFSET_CHECKSUM      = 28;   // ヘッダCRC32 (4バイト, LE)
-static constexpr size_t OFFSET_METADATA      = 32;   // メタデータ開始
-
-// メタデータ内オフセット (OFFSET_METADATA からの相対位置)
-static constexpr size_t META_COMPANY_NAME    = 0;    // 会社名 (64バイト, Shift-JIS)
-static constexpr size_t META_FISCAL_YEAR     = 64;   // 会計年度 (2バイト, LE)
-static constexpr size_t META_CREATED_DATE    = 66;   // 作成日 (8バイト: YYYYMMDD as chars)
-static constexpr size_t META_COMPATIBLE_VER  = 74;   // 互換バージョン (2バイト, LE)
-static constexpr size_t META_RESERVED        = 76;   // 予約領域 (20バイト)
-static constexpr size_t META_BLOCK_SIZE      = 96;   // メタデータブロックサイズ
-
-// ヘッダ最小サイズ (マジック + 固定フィールド + メタデータ)
-static constexpr size_t HEADER_MIN_SIZE = OFFSET_METADATA + META_BLOCK_SIZE;
-
-// バージョン12用の互換バージョン値
-static constexpr uint16_t COMPAT_VERSION_12  = 0x000C;
-// バージョン26用の互換バージョン値
-static constexpr uint16_t COMPAT_VERSION_26  = 0x001A;
-
-// フラグビット定義
-static constexpr uint32_t FLAG_COMPRESSED    = 0x0001; // データが圧縮されている
-static constexpr uint32_t FLAG_ENCRYPTED     = 0x0002; // データが暗号化されている (非サポート)
-static constexpr uint32_t FLAG_CHECKSUM      = 0x0004; // チェックサムあり
-
-#pragma pack(push, 1)
-
-/**
- * バックアップファイルヘッダ構造体
- * ファイル先頭に配置される固定長ヘッダ
- */
-struct KbFileHeader {
-    uint8_t  magic[4];          // "YAYO"
-    uint16_t file_version;      // ファイルフォーマットバージョン (LE)
-    uint16_t app_version;       // アプリバージョン (LE)
-    uint32_t flags;             // フラグフィールド
-    uint32_t header_size;       // ヘッダ全体のサイズ (メタデータ含む)
-    uint32_t data_offset;       // データブロック開始位置
-    uint32_t data_size;         // 圧縮済みデータサイズ
-    uint32_t orig_size;         // 圧縮前の元データサイズ
-    uint32_t header_checksum;   // このヘッダのCRC32 (この4バイト自体は0として計算)
+// ファイル先頭4バイト: "YZ" + ZIPローカルファイルヘッダサブタイプ
+static constexpr std::array<uint8_t, 4> YAYOI_MAGIC = {
+    0x59, 0x5A, 0x03, 0x04   // "YZ\x03\x04"
 };
 
-/**
- * メタデータ構造体
- * KbFileHeader の直後に配置
- */
-struct KbMetadata {
-    char     company_name[64];  // 会社名 (Shift-JIS, NUL終端)
-    uint16_t fiscal_year;       // 会計年度
-    char     created_date[8];   // 作成日 YYYYMMDD
-    uint16_t compat_version;    // 下位互換バージョン
-    uint8_t  reserved[20];      // 予約 (0埋め)
-};
+// YZ の各バイト (署名比較用)
+static constexpr uint8_t YAYOI_SIG_0 = 0x59; // 'Y'
+static constexpr uint8_t YAYOI_SIG_1 = 0x5A; // 'Z'
 
-#pragma pack(pop)
+// 標準ZIPの "PK" (インメモリパッチ・逆変換用)
+static constexpr uint8_t ZIP_PK_0 = 0x50; // 'P'
+static constexpr uint8_t ZIP_PK_1 = 0x4B; // 'K'
 
-static_assert(sizeof(KbFileHeader) == 32, "KbFileHeader size mismatch");
-static_assert(sizeof(KbMetadata)   == 96, "KbMetadata size mismatch");
+// ─────────────────────────────────────────────
+// ZIPシグネチャ後半2バイト (標準ZIP・YZ形式共通)
+// ─────────────────────────────────────────────
+
+static constexpr uint8_t ZIP_LOCAL_B2   = 0x03; // ローカルファイルヘッダ: \x03\x04
+static constexpr uint8_t ZIP_LOCAL_B3   = 0x04;
+static constexpr uint8_t ZIP_CDIR_B2    = 0x01; // セントラルディレクトリ: \x01\x02
+static constexpr uint8_t ZIP_CDIR_B3    = 0x02;
+static constexpr uint8_t ZIP_EOCD_B2    = 0x05; // エンドオブセントラルディレクトリ: \x05\x06
+static constexpr uint8_t ZIP_EOCD_B3    = 0x06;
+
+// ─────────────────────────────────────────────
+// ZIPローカルファイルヘッダ フィールドオフセット (先頭4バイト込み)
+// ─────────────────────────────────────────────
+static constexpr size_t ZIP_LFH_FLAGS            = 6;   // 汎用ビットフラグ (2バイト)
+static constexpr size_t ZIP_LFH_COMPRESSION      = 8;   // 圧縮方式 (2バイト)
+static constexpr size_t ZIP_LFH_CRC32            = 14;  // CRC-32 (4バイト)
+static constexpr size_t ZIP_LFH_COMPRESSED_SIZE  = 18;  // 圧縮後サイズ (4バイト)
+static constexpr size_t ZIP_LFH_FILENAME_LEN     = 26;  // ファイル名長 (2バイト)
+static constexpr size_t ZIP_LFH_EXTRA_LEN        = 28;  // 拡張フィールド長 (2バイト)
+static constexpr size_t ZIP_LFH_FIXED_SIZE       = 30;  // ファイル名以前の固定部分
+
+// ─────────────────────────────────────────────
+// ZIPセントラルディレクトリエントリ フィールドオフセット (先頭4バイト込み)
+// ─────────────────────────────────────────────
+static constexpr size_t ZIP_CDE_COMPRESSED_SIZE  = 20;  // 圧縮後サイズ (4バイト)
+static constexpr size_t ZIP_CDE_FILENAME_LEN     = 28;  // ファイル名長 (2バイト)
+static constexpr size_t ZIP_CDE_EXTRA_LEN        = 30;  // 拡張フィールド長 (2バイト)
+static constexpr size_t ZIP_CDE_COMMENT_LEN      = 32;  // コメント長 (2バイト)
+static constexpr size_t ZIP_CDE_LOCAL_OFFSET     = 42;  // ローカルヘッダ位置 (4バイト)
+static constexpr size_t ZIP_CDE_FIXED_SIZE       = 46;  // ファイル名以前の固定部分
+
+// ─────────────────────────────────────────────
+// ZIPエンドオブセントラルディレクトリ フィールドオフセット (先頭4バイト込み)
+// ─────────────────────────────────────────────
+static constexpr size_t ZIP_EOCD_CD_ENTRIES_TOTAL = 10; // 総エントリ数 (2バイト)
+static constexpr size_t ZIP_EOCD_CD_SIZE          = 12; // セントラルディレクトリサイズ (4バイト)
+static constexpr size_t ZIP_EOCD_CD_OFFSET        = 16; // セントラルディレクトリ開始位置 (4バイト)
+static constexpr size_t ZIP_EOCD_COMMENT_LEN      = 20; // ZIPコメント長 (2バイト)
+static constexpr size_t ZIP_EOCD_FIXED_SIZE       = 22; // コメント以前の固定部分
+
+// ─────────────────────────────────────────────
+// その他定数
+// ─────────────────────────────────────────────
+
+// ZIPコメントの最大長 (65535バイト)
+static constexpr size_t ZIP_MAX_COMMENT_SIZE = 65535;
+
+// ファイルの最小有効サイズ
+static constexpr size_t YAYOI_MIN_FILE_SIZE = ZIP_LFH_FIXED_SIZE + ZIP_EOCD_FIXED_SIZE;

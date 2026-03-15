@@ -2,70 +2,51 @@
  * kb_converter.cpp
  * 弥生会計バックアップファイル KB12→KB26 コンバータ 実装
  *
- * 変換フロー:
- *   1. 入力ファイル (.KB12) をバイト列として読み込む
- *   2. マジックバイト・バージョンを検証
- *   3. ヘッダチェックサムを確認
- *   4. バージョンフィールドを 12→26 に更新
- *      - KbFileHeader::file_version
- *      - KbFileHeader::app_version
- *      - KbMetadata::compat_version
- *   5. ヘッダチェックサムを再計算
- *   6. 出力ファイル (.KB26) に書き出す
+ * ファイル形式について:
+ *   弥生会計のバックアップファイルは変形ZIPアーカイブ形式を使用する。
+ *   標準ZIPの署名 "PK" (0x50 0x4B) がすべて "YZ" (0x59 0x5A) に
+ *   置き換えられている。
  *
- * 注意:
- *   データブロック (圧縮済みデータ) は変換前後で内容を変更しない。
- *   これはバックアップデータ自体の互換性はYayoi会計アプリ側が担保するためであり、
- *   本ツールはファイル識別子 (バージョンヘッダ) のみを更新する。
+ * 変換フロー:
+ *   1. 入力ファイルを読み込む
+ *   2. 先頭マジックバイト "YZ\x03\x04" を確認
+ *   3. ZIPのエンドオブセントラルディレクトリ (EOCD) を末尾から探す
+ *   4. セントラルディレクトリを解析し、エントリ名を取得する
+ *   5. エントリ名・ZIPコメントに含まれる "12" を "26" に書き換える
+ *      (ローカルファイルヘッダとセントラルディレクトリの両方を更新)
+ *   6. 出力ファイルに書き出す
+ *
+ * TODO (要調査):
+ *   エントリ名やZIPコメントにバージョン文字列が見当たらない場合、
+ *   バージョン情報が圧縮データ内に格納されている可能性がある。
+ *   その場合は解凍・パッチ・再圧縮が必要になる。
+ *   実ファイルのZIPエントリ一覧を確認して格納場所を特定すること。
+ *
+ *   確認コマンド (Python):
+ *     import zipfile, io
+ *     data = bytearray(open("file.KB12","rb").read())
+ *     data[0], data[1] = 0x50, 0x4B  # YZ -> PK
+ *     z = zipfile.ZipFile(io.BytesIO(bytes(data)))
+ *     print(z.namelist())
  */
 
 #include "kb_converter.h"
 #include "kb_format.h"
 
 #include <fstream>
-#include <iostream>
 #include <sstream>
 #include <cstring>
-#include <stdexcept>
-
-// ─────────────────────────────────────────────
-// CRC32 実装 (外部ライブラリ不要)
-// ─────────────────────────────────────────────
-
-static uint32_t crc32_table[256];
-static bool     crc32_table_initialized = false;
-
-static void init_crc32_table() {
-    if (crc32_table_initialized) return;
-    for (uint32_t i = 0; i < 256; ++i) {
-        uint32_t c = i;
-        for (int j = 0; j < 8; ++j) {
-            c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
-        }
-        crc32_table[i] = c;
-    }
-    crc32_table_initialized = true;
-}
-
-static uint32_t calc_crc32(const uint8_t* data, size_t length) {
-    init_crc32_table();
-    uint32_t crc = 0xFFFFFFFFu;
-    for (size_t i = 0; i < length; ++i) {
-        crc = crc32_table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
-    }
-    return crc ^ 0xFFFFFFFFu;
-}
+#include <algorithm>
+#include <cctype>
 
 // ─────────────────────────────────────────────
 // ユーティリティ
 // ─────────────────────────────────────────────
 
-/** リトルエンディアン uint16_t 読み取り */
 static inline uint16_t read_le16(const uint8_t* p) {
     return static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
 }
 
-/** リトルエンディアン uint32_t 読み取り */
 static inline uint32_t read_le32(const uint8_t* p) {
     return static_cast<uint32_t>(p[0])
          | (static_cast<uint32_t>(p[1]) << 8)
@@ -73,21 +54,6 @@ static inline uint32_t read_le32(const uint8_t* p) {
          | (static_cast<uint32_t>(p[3]) << 24);
 }
 
-/** リトルエンディアン uint16_t 書き込み */
-static inline void write_le16(uint8_t* p, uint16_t v) {
-    p[0] = static_cast<uint8_t>(v & 0xFF);
-    p[1] = static_cast<uint8_t>((v >> 8) & 0xFF);
-}
-
-/** リトルエンディアン uint32_t 書き込み */
-static inline void write_le32(uint8_t* p, uint32_t v) {
-    p[0] = static_cast<uint8_t>(v & 0xFF);
-    p[1] = static_cast<uint8_t>((v >> 8) & 0xFF);
-    p[2] = static_cast<uint8_t>((v >> 16) & 0xFF);
-    p[3] = static_cast<uint8_t>((v >> 24) & 0xFF);
-}
-
-/** ファイル全体をバイト列で読み込む */
 static bool read_file(const std::string& path, std::vector<uint8_t>& buf) {
     std::ifstream ifs(path, std::ios::binary | std::ios::ate);
     if (!ifs) return false;
@@ -95,70 +61,156 @@ static bool read_file(const std::string& path, std::vector<uint8_t>& buf) {
     if (size <= 0) return false;
     ifs.seekg(0, std::ios::beg);
     buf.resize(static_cast<size_t>(size));
-    if (!ifs.read(reinterpret_cast<char*>(buf.data()), size)) return false;
-    return true;
+    return static_cast<bool>(ifs.read(reinterpret_cast<char*>(buf.data()), size));
 }
 
-/** バイト列をファイルに書き出す */
 static bool write_file(const std::string& path, const std::vector<uint8_t>& buf) {
     std::ofstream ofs(path, std::ios::binary | std::ios::trunc);
     if (!ofs) return false;
-    if (!ofs.write(reinterpret_cast<const char*>(buf.data()),
-                   static_cast<std::streamsize>(buf.size()))) {
-        return false;
-    }
-    return true;
+    return static_cast<bool>(ofs.write(reinterpret_cast<const char*>(buf.data()),
+                                       static_cast<std::streamsize>(buf.size())));
 }
 
 // ─────────────────────────────────────────────
-// ヘッダ検証
+// ZIPシグネチャ検出 (YZ形式)
 // ─────────────────────────────────────────────
 
 /**
- * バッファがYayoiバックアップのマジックバイトを持つか確認する。
- * 先頭4バイトが "YAYO" であれば true を返す。
+ * buf[pos] に YZ + 指定後半2バイトの4バイトシグネチャがあるか確認する。
+ * buf の範囲外アクセスを避けるため、pos + 3 < buf.size() を前提とする。
  */
+static bool has_yayoi_sig(const std::vector<uint8_t>& buf, size_t pos,
+                           uint8_t b2, uint8_t b3)
+{
+    return (pos + 3 < buf.size())
+        && buf[pos + 0] == YAYOI_SIG_0
+        && buf[pos + 1] == YAYOI_SIG_1
+        && buf[pos + 2] == b2
+        && buf[pos + 3] == b3;
+}
+
+/** 先頭4バイトが弥生バックアップのマジックか確認する */
 static bool check_magic(const std::vector<uint8_t>& buf) {
     if (buf.size() < 4) return false;
-    return (buf[0] == YAYOI_MAGIC[0] &&
-            buf[1] == YAYOI_MAGIC[1] &&
-            buf[2] == YAYOI_MAGIC[2] &&
-            buf[3] == YAYOI_MAGIC[3]);
+    return buf[0] == YAYOI_MAGIC[0]
+        && buf[1] == YAYOI_MAGIC[1]
+        && buf[2] == YAYOI_MAGIC[2]
+        && buf[3] == YAYOI_MAGIC[3];
 }
 
+// ─────────────────────────────────────────────
+// EOCD (エンドオブセントラルディレクトリ) 検索
+// ─────────────────────────────────────────────
+
 /**
- * ヘッダチェックサムを検証する。
- * header_checksum フィールド (offset 28..31) を 0 として CRC32 を計算し、
- * 格納値と比較する。
+ * ファイル末尾から EOCD シグネチャ "YZ\x05\x06" を探す。
+ * 見つかった場合は eocd_offset に位置を格納して true を返す。
  *
- * @param buf         ファイルバッファ
- * @param header_size ヘッダサイズ (メタデータを含む)
- * @return true: チェックサム一致
+ * EOCDは末尾から最大 EOCD固定部 + ZIPコメント最大長 (65535) の範囲に存在する。
+ * 複数の候補がある場合は最も末尾寄りで整合性が取れるものを採用する。
  */
-static bool verify_header_checksum(const std::vector<uint8_t>& buf, uint32_t header_size) {
-    if (buf.size() < header_size) return false;
+static bool find_eocd(const std::vector<uint8_t>& buf, size_t& eocd_offset) {
+    if (buf.size() < ZIP_EOCD_FIXED_SIZE) return false;
 
-    // チェックサムフィールドを一時的に 0 にしてコピーを作成
-    std::vector<uint8_t> tmp(buf.begin(), buf.begin() + header_size);
-    write_le32(tmp.data() + OFFSET_CHECKSUM, 0);
+    const size_t search_limit = buf.size() - ZIP_EOCD_FIXED_SIZE;
+    const size_t search_start = (buf.size() > ZIP_EOCD_FIXED_SIZE + ZIP_MAX_COMMENT_SIZE)
+                                ? buf.size() - ZIP_EOCD_FIXED_SIZE - ZIP_MAX_COMMENT_SIZE
+                                : 0;
 
-    uint32_t calc = calc_crc32(tmp.data(), header_size);
-    uint32_t stored = read_le32(buf.data() + OFFSET_CHECKSUM);
-
-    return calc == stored;
+    // 末尾から前方向に走査
+    for (size_t i = search_limit; ; --i) {
+        if (has_yayoi_sig(buf, i, ZIP_EOCD_B2, ZIP_EOCD_B3)) {
+            // ZIPコメント長フィールドとファイル末尾が一致するか検証する
+            uint16_t comment_len = read_le16(buf.data() + i + ZIP_EOCD_COMMENT_LEN);
+            if (i + ZIP_EOCD_FIXED_SIZE + comment_len == buf.size()) {
+                eocd_offset = i;
+                return true;
+            }
+        }
+        if (i == search_start) break;
+    }
+    return false;
 }
 
+// ─────────────────────────────────────────────
+// ZIPエントリ情報
+// ─────────────────────────────────────────────
+
+struct ZipEntry {
+    size_t      cd_offset;      // セントラルディレクトリ内の位置
+    size_t      local_offset;   // ローカルファイルヘッダの位置
+    std::string name;           // エントリ名
+    uint16_t    name_len;       // エントリ名バイト長
+};
+
 /**
- * ヘッダチェックサムを再計算してバッファに書き込む。
- *
- * @param buf         ファイルバッファ (インプレース更新)
- * @param header_size ヘッダサイズ
+ * セントラルディレクトリを解析して ZipEntry の一覧を返す。
+ * 返り値: エントリを解析できた数 (失敗時は -1)
  */
-static void update_header_checksum(std::vector<uint8_t>& buf, uint32_t header_size) {
-    // チェックサムフィールドを 0 にして計算
-    write_le32(buf.data() + OFFSET_CHECKSUM, 0);
-    uint32_t crc = calc_crc32(buf.data(), header_size);
-    write_le32(buf.data() + OFFSET_CHECKSUM, crc);
+static int parse_central_directory(const std::vector<uint8_t>& buf,
+                                    size_t cd_offset, uint32_t cd_size,
+                                    uint16_t num_entries,
+                                    std::vector<ZipEntry>& entries)
+{
+    if (cd_offset + cd_size > buf.size()) return -1;
+
+    size_t pos = cd_offset;
+    const size_t cd_end = cd_offset + cd_size;
+    int count = 0;
+
+    for (uint16_t i = 0; i < num_entries; ++i) {
+        // セントラルディレクトリエントリのシグネチャ確認 "YZ\x01\x02"
+        if (pos + ZIP_CDE_FIXED_SIZE > cd_end) return -1;
+        if (!has_yayoi_sig(buf, pos, ZIP_CDIR_B2, ZIP_CDIR_B3)) return -1;
+
+        uint16_t name_len    = read_le16(buf.data() + pos + ZIP_CDE_FILENAME_LEN);
+        uint16_t extra_len   = read_le16(buf.data() + pos + ZIP_CDE_EXTRA_LEN);
+        uint16_t comment_len = read_le16(buf.data() + pos + ZIP_CDE_COMMENT_LEN);
+        uint32_t local_off   = read_le32(buf.data() + pos + ZIP_CDE_LOCAL_OFFSET);
+
+        if (pos + ZIP_CDE_FIXED_SIZE + name_len > cd_end) return -1;
+
+        ZipEntry entry;
+        entry.cd_offset    = pos;
+        entry.local_offset = static_cast<size_t>(local_off);
+        entry.name_len     = name_len;
+        entry.name.assign(
+            reinterpret_cast<const char*>(buf.data() + pos + ZIP_CDE_FIXED_SIZE),
+            name_len
+        );
+
+        entries.push_back(entry);
+        ++count;
+
+        pos += ZIP_CDE_FIXED_SIZE + name_len + extra_len + comment_len;
+    }
+    return count;
+}
+
+// ─────────────────────────────────────────────
+// バージョン文字列パッチ
+// ─────────────────────────────────────────────
+
+/**
+ * バッファ内 offset から name_len バイトのエントリ名を読み取り、
+ * "12" を "26" に置換して書き戻す。
+ * 置換が1件以上行われた場合 true を返す。
+ *
+ * 注意: "12" という部分文字列が年月日など無関係な箇所に現れる可能性がある。
+ *       現状は単純置換としているが、実ファイルで検証後に絞り込むことを推奨する。
+ */
+static bool patch_version_in_name(std::vector<uint8_t>& buf,
+                                   size_t name_offset, uint16_t name_len)
+{
+    bool patched = false;
+    for (uint16_t i = 0; i + 1 < name_len; ++i) {
+        if (buf[name_offset + i] == '1' && buf[name_offset + i + 1] == '2') {
+            buf[name_offset + i]     = '2';
+            buf[name_offset + i + 1] = '6';
+            patched = true;
+        }
+    }
+    return patched;
 }
 
 // ─────────────────────────────────────────────
@@ -171,11 +223,13 @@ const char* convert_result_to_string(ConvertResult result) {
         case ConvertResult::ERR_INPUT_NOT_FOUND:    return "入力ファイルが見つかりません";
         case ConvertResult::ERR_INPUT_READ_FAILED:  return "入力ファイルの読み込みに失敗しました";
         case ConvertResult::ERR_OUTPUT_WRITE_FAILED:return "出力ファイルの書き込みに失敗しました";
-        case ConvertResult::ERR_INVALID_MAGIC:      return "Yayoiバックアップファイルではありません (マジックバイト不一致)";
+        case ConvertResult::ERR_INVALID_MAGIC:      return "Yayoiバックアップファイルではありません"
+                                                           " (先頭バイトが YZ\\x03\\x04 でない)";
         case ConvertResult::ERR_INVALID_VERSION:    return "変換対象のバージョンではありません (KB12 のみ変換可能)";
-        case ConvertResult::ERR_INVALID_HEADER:     return "ヘッダが不正または破損しています";
+        case ConvertResult::ERR_INVALID_HEADER:     return "ZIPヘッダが不正または破損しています";
         case ConvertResult::ERR_CHECKSUM_MISMATCH:  return "チェックサムが一致しません (ファイルが破損している可能性があります)";
-        case ConvertResult::ERR_UNSUPPORTED_FEATURE:return "非対応の機能が含まれています (暗号化ファイルは変換できません)";
+        case ConvertResult::ERR_UNSUPPORTED_FEATURE:return "バージョン情報がエントリ名・ZIPコメントに見つかりませんでした。"
+                                                           " 圧縮データ内に格納されている可能性があります (要調査)";
         case ConvertResult::ERR_TRUNCATED_FILE:     return "ファイルが途中で切れています";
         default:                                    return "不明なエラー";
     }
@@ -195,7 +249,6 @@ ConvertResult convert_kb12_to_kb26(
 
     std::vector<uint8_t> buf;
     if (!read_file(input_path, buf)) {
-        // ファイルが存在するか区別
         std::ifstream test(input_path);
         return test ? ConvertResult::ERR_INPUT_READ_FAILED
                     : ConvertResult::ERR_INPUT_NOT_FOUND;
@@ -203,101 +256,97 @@ ConvertResult convert_kb12_to_kb26(
 
     notify("ファイルを読み込みました (" + std::to_string(buf.size()) + " bytes)", 10);
 
-    // ── Step 2: マジックバイト確認 ───────────────────────────
+    // ── Step 2: マジックバイト確認 "YZ\x03\x04" ──────────────
     notify("マジックバイトを確認しています...", 15);
 
     if (!check_magic(buf)) {
         return ConvertResult::ERR_INVALID_MAGIC;
     }
 
-    // ── Step 3: ヘッダ最小サイズ確認 ────────────────────────
-    if (buf.size() < HEADER_MIN_SIZE) {
+    if (buf.size() < YAYOI_MIN_FILE_SIZE) {
         return ConvertResult::ERR_TRUNCATED_FILE;
     }
 
-    uint16_t file_ver    = read_le16(buf.data() + OFFSET_FILE_VERSION);
-    uint32_t flags       = read_le32(buf.data() + OFFSET_FLAGS);
-    uint32_t header_size = read_le32(buf.data() + OFFSET_HEADER_SIZE);
-    uint32_t data_offset = read_le32(buf.data() + OFFSET_DATA_OFFSET);
-    uint32_t data_size   = read_le32(buf.data() + OFFSET_DATA_SIZE);
+    // ── Step 3: EOCD を末尾から探す ──────────────────────────
+    notify("ZIPエンドレコードを検索しています...", 25);
 
-    // ── Step 4: バージョン確認 ───────────────────────────────
-    notify("バージョンを確認しています...", 20);
-
-    if (file_ver != KB_VERSION_12) {
-        return ConvertResult::ERR_INVALID_VERSION;
-    }
-
-    // ── Step 5: ヘッダサイズ整合性確認 ──────────────────────
-    if (header_size < HEADER_MIN_SIZE) {
+    size_t eocd_offset = 0;
+    if (!find_eocd(buf, eocd_offset)) {
         return ConvertResult::ERR_INVALID_HEADER;
     }
-    if (buf.size() < header_size) {
-        return ConvertResult::ERR_TRUNCATED_FILE;
+
+    uint16_t num_entries = read_le16(buf.data() + eocd_offset + ZIP_EOCD_CD_ENTRIES_TOTAL);
+    uint32_t cd_size     = read_le32(buf.data() + eocd_offset + ZIP_EOCD_CD_SIZE);
+    uint32_t cd_offset   = read_le32(buf.data() + eocd_offset + ZIP_EOCD_CD_OFFSET);
+    uint16_t zip_comment_len = read_le16(buf.data() + eocd_offset + ZIP_EOCD_COMMENT_LEN);
+
+    notify("ZIPエントリ数: " + std::to_string(num_entries), 30);
+
+    if (cd_offset + cd_size > buf.size()) {
+        return ConvertResult::ERR_INVALID_HEADER;
     }
 
-    // ── Step 6: 暗号化フラグ確認 ────────────────────────────
-    if (flags & FLAG_ENCRYPTED) {
+    // ── Step 4: セントラルディレクトリを解析 ─────────────────
+    notify("セントラルディレクトリを解析しています...", 40);
+
+    std::vector<ZipEntry> entries;
+    if (parse_central_directory(buf, cd_offset, cd_size, num_entries, entries) < 0) {
+        return ConvertResult::ERR_INVALID_HEADER;
+    }
+
+    // エントリ名をログ出力 (デバッグ・フォーマット調査用)
+    for (const auto& e : entries) {
+        notify("  エントリ: \"" + e.name + "\"", -1);
+    }
+
+    // ── Step 5: バージョン文字列 "12" を "26" に書き換える ───
+    notify("バージョン情報を更新しています...", 60);
+
+    bool any_patched = false;
+
+    // 5a. セントラルディレクトリのエントリ名を更新
+    for (const auto& e : entries) {
+        size_t cd_name_offset = e.cd_offset + ZIP_CDE_FIXED_SIZE;
+        if (patch_version_in_name(buf, cd_name_offset, e.name_len)) {
+            any_patched = true;
+            notify("  CD エントリ名を更新: \"" + e.name + "\"", -1);
+        }
+
+        // 5b. 対応するローカルファイルヘッダのエントリ名も更新する
+        size_t lfh = e.local_offset;
+        if (lfh + ZIP_LFH_FIXED_SIZE > buf.size()) continue;
+        if (!has_yayoi_sig(buf, lfh, ZIP_LOCAL_B2, ZIP_LOCAL_B3)) continue;
+
+        uint16_t lfh_name_len = read_le16(buf.data() + lfh + ZIP_LFH_FILENAME_LEN);
+        if (lfh + ZIP_LFH_FIXED_SIZE + lfh_name_len > buf.size()) continue;
+
+        size_t lfh_name_offset = lfh + ZIP_LFH_FIXED_SIZE;
+        if (patch_version_in_name(buf, lfh_name_offset, lfh_name_len)) {
+            any_patched = true;
+        }
+    }
+
+    // 5c. ZIPコメントを更新
+    if (zip_comment_len > 0) {
+        size_t zip_comment_offset = eocd_offset + ZIP_EOCD_FIXED_SIZE;
+        for (uint16_t i = 0; i + 1 < zip_comment_len; ++i) {
+            if (buf[zip_comment_offset + i]     == '1' &&
+                buf[zip_comment_offset + i + 1] == '2')
+            {
+                buf[zip_comment_offset + i]     = '2';
+                buf[zip_comment_offset + i + 1] = '6';
+                any_patched = true;
+            }
+        }
+    }
+
+    if (!any_patched) {
+        // バージョン文字列が見つからなかった場合
+        // 圧縮データ内に格納されている可能性があるため調査が必要
         return ConvertResult::ERR_UNSUPPORTED_FEATURE;
     }
 
-    // ── Step 7: ヘッダチェックサム検証 ──────────────────────
-    notify("チェックサムを検証しています...", 30);
-
-    if (flags & FLAG_CHECKSUM) {
-        if (!verify_header_checksum(buf, header_size)) {
-            return ConvertResult::ERR_CHECKSUM_MISMATCH;
-        }
-    }
-
-    // ── Step 8: データブロックの範囲確認 ────────────────────
-    notify("データブロックの整合性を確認しています...", 40);
-
-    if (data_offset < header_size) {
-        return ConvertResult::ERR_INVALID_HEADER;
-    }
-    if (buf.size() < static_cast<size_t>(data_offset) + data_size) {
-        return ConvertResult::ERR_TRUNCATED_FILE;
-    }
-
-    // ── Step 9: バージョンフィールドを更新 ──────────────────
-    notify("バージョン情報を更新しています...", 60);
-
-    // KbFileHeader のバージョンフィールドを更新
-    write_le16(buf.data() + OFFSET_FILE_VERSION, KB_VERSION_26);
-    write_le16(buf.data() + OFFSET_APP_VERSION,  KB_VERSION_26);
-
-    // KbMetadata の互換バージョンフィールドを更新
-    // メタデータは header の固定フィールド (32バイト) の直後から始まる
-    const size_t meta_compat_offset = OFFSET_METADATA + META_COMPATIBLE_VER;
-    if (header_size >= meta_compat_offset + 2) {
-        uint16_t compat = read_le16(buf.data() + meta_compat_offset);
-        // 互換バージョンが12を示している場合のみ更新
-        if (compat == COMPAT_VERSION_12) {
-            write_le16(buf.data() + meta_compat_offset, COMPAT_VERSION_26);
-        }
-    }
-
-    // ── Step 10: ヘッダチェックサムを再計算 ─────────────────
-    notify("チェックサムを再計算しています...", 75);
-
-    if (flags & FLAG_CHECKSUM) {
-        update_header_checksum(buf, header_size);
-    }
-
-    // ── Step 11: ファイル末尾のデータチェックサムを再計算 ───
-    // データブロック末尾に全体チェックサムが存在する場合に更新する
-    // (data_offset + data_size が buf.size() - 4 と等しい場合、末尾4バイトがCRC32とみなす)
-    const size_t expected_end = static_cast<size_t>(data_offset) + data_size;
-    if (expected_end + 4 == buf.size()) {
-        notify("ファイル全体チェックサムを再計算しています...", 85);
-        // ファイル全体 (チェックサムフィールド除く) の CRC32
-        write_le32(buf.data() + expected_end, 0);
-        uint32_t file_crc = calc_crc32(buf.data(), expected_end);
-        write_le32(buf.data() + expected_end, file_crc);
-    }
-
-    // ── Step 12: 書き出し ────────────────────────────────────
+    // ── Step 6: 書き出し ─────────────────────────────────────
     notify("出力ファイルに書き込んでいます...", 90);
 
     if (!write_file(output_path, buf)) {
@@ -322,35 +371,19 @@ bool validate_kb12_file(const std::string& file_path, std::string* error_msg) {
     }
 
     if (!check_magic(buf)) {
-        return set_err("Yayoiバックアップファイルではありません");
+        return set_err("Yayoiバックアップファイルではありません"
+                       " (期待: YZ\\x03\\x04, 実際の先頭バイト: "
+                       + (buf.size() >= 1 ? std::to_string(buf[0]) : "?")
+                       + " " + (buf.size() >= 2 ? std::to_string(buf[1]) : "?") + ")");
     }
 
-    if (buf.size() < HEADER_MIN_SIZE) {
+    if (buf.size() < YAYOI_MIN_FILE_SIZE) {
         return set_err("ファイルが短すぎます");
     }
 
-    uint16_t ver = read_le16(buf.data() + OFFSET_FILE_VERSION);
-    if (ver != KB_VERSION_12) {
-        std::ostringstream oss;
-        oss << "バージョンが KB12 ではありません (検出されたバージョン: " << ver << ")";
-        return set_err(oss.str());
-    }
-
-    uint32_t flags       = read_le32(buf.data() + OFFSET_FLAGS);
-    uint32_t header_size = read_le32(buf.data() + OFFSET_HEADER_SIZE);
-
-    if (flags & FLAG_ENCRYPTED) {
-        return set_err("暗号化ファイルは変換に対応していません");
-    }
-
-    if (header_size < HEADER_MIN_SIZE || buf.size() < header_size) {
-        return set_err("ヘッダが不正または破損しています");
-    }
-
-    if (flags & FLAG_CHECKSUM) {
-        if (!verify_header_checksum(buf, header_size)) {
-            return set_err("ヘッダチェックサムが一致しません (ファイルが破損している可能性があります)");
-        }
+    size_t eocd_offset = 0;
+    if (!find_eocd(buf, eocd_offset)) {
+        return set_err("ZIPエンドレコードが見つかりません (ファイルが破損している可能性があります)");
     }
 
     if (error_msg) *error_msg = "";
@@ -358,9 +391,10 @@ bool validate_kb12_file(const std::string& file_path, std::string* error_msg) {
 }
 
 uint16_t get_kb_file_version(const std::string& file_path) {
+    // TODO: ZIPエントリ名またはコメントからバージョン番号を取得する実装
+    //       現在はマジックバイトが正しければ 12 を返す暫定実装
     std::vector<uint8_t> buf;
     if (!read_file(file_path, buf)) return 0;
     if (!check_magic(buf)) return 0;
-    if (buf.size() < OFFSET_FILE_VERSION + 2) return 0;
-    return read_le16(buf.data() + OFFSET_FILE_VERSION);
+    return 12;
 }
