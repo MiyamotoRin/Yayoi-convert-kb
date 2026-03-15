@@ -117,6 +117,28 @@ static bool has_yayoi_sig(const std::vector<uint8_t>& buf, size_t pos,
         && buf[pos + 3] == b3;
 }
 
+/**
+ * buf[pos] に標準ZIP PK + 指定後半2バイトの4バイトシグネチャがあるか確認する。
+ * KB12ファイルによっては先頭 LFH だけ YZ に変換されていて、
+ * EOCD やセントラルディレクトリは標準の PK シグネチャのままの場合がある。
+ */
+static bool has_pk_sig(const std::vector<uint8_t>& buf, size_t pos,
+                        uint8_t b2, uint8_t b3)
+{
+    return (pos + 3 < buf.size())
+        && buf[pos + 0] == ZIP_PK_0
+        && buf[pos + 1] == ZIP_PK_1
+        && buf[pos + 2] == b2
+        && buf[pos + 3] == b3;
+}
+
+/** YZ または PK どちらかのシグネチャにマッチするか確認する */
+static bool has_zip_sig(const std::vector<uint8_t>& buf, size_t pos,
+                         uint8_t b2, uint8_t b3)
+{
+    return has_yayoi_sig(buf, pos, b2, b3) || has_pk_sig(buf, pos, b2, b3);
+}
+
 /** 先頭4バイトが弥生バックアップのマジックか確認する */
 static bool check_magic(const std::vector<uint8_t>& buf) {
     if (buf.size() < 4) return false;
@@ -145,9 +167,9 @@ static bool find_eocd(const std::vector<uint8_t>& buf, size_t& eocd_offset) {
                                 ? buf.size() - ZIP_EOCD_FIXED_SIZE - ZIP_MAX_COMMENT_SIZE
                                 : 0;
 
-    // 末尾から前方向に走査
+    // 末尾から前方向に走査 (YZ・PK 両形式に対応)
     for (size_t i = search_limit; ; --i) {
-        if (has_yayoi_sig(buf, i, ZIP_EOCD_B2, ZIP_EOCD_B3)) {
+        if (has_zip_sig(buf, i, ZIP_EOCD_B2, ZIP_EOCD_B3)) {
             // ZIPコメント長フィールドとファイル末尾が一致するか検証する
             uint16_t comment_len = read_le16(buf.data() + i + ZIP_EOCD_COMMENT_LEN);
             if (i + ZIP_EOCD_FIXED_SIZE + comment_len == buf.size()) {
@@ -189,7 +211,7 @@ static int parse_central_directory(const std::vector<uint8_t>& buf,
     for (uint16_t i = 0; i < num_entries; ++i) {
         // セントラルディレクトリエントリのシグネチャ確認 "YZ\x01\x02"
         if (pos + ZIP_CDE_FIXED_SIZE > cd_end) return -1;
-        if (!has_yayoi_sig(buf, pos, ZIP_CDIR_B2, ZIP_CDIR_B3)) return -1;
+        if (!has_zip_sig(buf, pos, ZIP_CDIR_B2, ZIP_CDIR_B3)) return -1;
 
         uint16_t name_len    = read_le16(buf.data() + pos + ZIP_CDE_FILENAME_LEN);
         uint16_t extra_len   = read_le16(buf.data() + pos + ZIP_CDE_EXTRA_LEN);
@@ -348,7 +370,7 @@ ConvertResult convert_kb12_to_kb26(
         // 5b. 対応するローカルファイルヘッダのエントリ名も更新する
         size_t lfh = e.local_offset;
         if (lfh + ZIP_LFH_FIXED_SIZE > buf.size()) continue;
-        if (!has_yayoi_sig(buf, lfh, ZIP_LOCAL_B2, ZIP_LOCAL_B3)) continue;
+        if (!has_zip_sig(buf, lfh, ZIP_LOCAL_B2, ZIP_LOCAL_B3)) continue;
 
         uint16_t lfh_name_len = read_le16(buf.data() + lfh + ZIP_LFH_FILENAME_LEN);
         if (lfh + ZIP_LFH_FIXED_SIZE + lfh_name_len > buf.size()) continue;
