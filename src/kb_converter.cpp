@@ -37,6 +37,9 @@
 #include <cstring>
 #include <algorithm>
 #include <cctype>
+#include <iomanip>
+#include <iostream>
+#include <sstream>
 #ifdef _WIN32
 #  include <windows.h>
 #endif
@@ -457,4 +460,174 @@ uint16_t get_kb_file_version(const std::string& file_path) {
     if (!read_file(file_path, buf)) return 0;
     if (!check_magic(buf)) return 0;
     return 12;
+}
+
+// ─────────────────────────────────────────────
+// 診断ユーティリティ
+// ─────────────────────────────────────────────
+
+/** バイト列を "XX XX XX ..." 形式のhex文字列に変換する */
+static std::string hex_dump(const uint8_t* p, size_t len) {
+    std::ostringstream oss;
+    for (size_t i = 0; i < len; ++i) {
+        if (i) oss << ' ';
+        oss << std::hex << std::uppercase
+            << std::setw(2) << std::setfill('0')
+            << static_cast<unsigned>(p[i]);
+    }
+    return oss.str();
+}
+
+/** バイトを印字可能なASCII文字または '.' に変換する */
+static char to_printable(uint8_t b) {
+    return (b >= 0x20 && b < 0x7F) ? static_cast<char>(b) : '.';
+}
+
+/** 16バイト単位のhexダンプ行を出力する */
+static void print_hex_region(const std::vector<uint8_t>& buf,
+                               size_t start, size_t len,
+                               const std::string& label)
+{
+    std::cout << label << " (offset 0x"
+              << std::hex << std::uppercase << start << " から "
+              << std::dec << len << " バイト):\n";
+    for (size_t i = 0; i < len; i += 16) {
+        size_t row_len = std::min<size_t>(16, len - i);
+        std::cout << "  " << std::hex << std::uppercase
+                  << std::setw(6) << std::setfill('0') << (start + i) << "  ";
+        for (size_t j = 0; j < row_len; ++j) {
+            std::cout << std::setw(2) << std::setfill('0')
+                      << static_cast<unsigned>(buf[start + i + j]) << ' ';
+        }
+        for (size_t j = row_len; j < 16; ++j) std::cout << "   ";
+        std::cout << " |";
+        for (size_t j = 0; j < row_len; ++j)
+            std::cout << to_printable(buf[start + i + j]);
+        std::cout << "|\n";
+    }
+    std::cout << std::dec;
+}
+
+void diagnose_kb_file(const std::string& file_path) {
+    std::cout << "=== KB ファイル診断 ===\n";
+    std::cout << "ファイル: " << file_path << "\n\n";
+
+    std::vector<uint8_t> buf;
+    if (!read_file(file_path, buf)) {
+        std::cout << "[ERROR] ファイルを読み込めませんでした\n";
+        return;
+    }
+
+    // ── 基本情報 ─────────────────────────────────────────────
+    std::cout << "ファイルサイズ: " << buf.size() << " バイト (0x"
+              << std::hex << std::uppercase << buf.size() << ")\n\n"
+              << std::dec;
+
+    // ── 先頭32バイト ─────────────────────────────────────────
+    size_t head_len = std::min<size_t>(32, buf.size());
+    print_hex_region(buf, 0, head_len, "先頭 32 バイト");
+    std::cout << "\n";
+
+    // ── 末尾64バイト ─────────────────────────────────────────
+    size_t tail_len = std::min<size_t>(64, buf.size());
+    size_t tail_start = buf.size() - tail_len;
+    print_hex_region(buf, tail_start, tail_len, "末尾 64 バイト");
+    std::cout << "\n";
+
+    // ── マジックバイト確認 ────────────────────────────────────
+    std::cout << "--- マジックバイト ---\n";
+    if (buf.size() >= 4) {
+        std::cout << "先頭 4 バイト: " << hex_dump(buf.data(), 4) << "\n";
+        bool is_yayoi = check_magic(buf);
+        bool is_pk    = (buf[0] == 'P' && buf[1] == 'K');
+        std::cout << "  -> " << (is_yayoi ? "YZ 形式 (Yayoi バックアップ)" :
+                                  is_pk    ? "PK 形式 (標準 ZIP)" :
+                                             "不明な形式") << "\n";
+    }
+    std::cout << "\n";
+
+    // ── シグネチャ出現位置スキャン ────────────────────────────
+    struct SigInfo { uint8_t b0, b1, b2, b3; const char* name; };
+    SigInfo sigs[] = {
+        { 'Y','Z',0x03,0x04, "YZ ローカルファイルヘッダ (YZ\\x03\\x04)" },
+        { 'Y','Z',0x01,0x02, "YZ セントラルディレクトリ  (YZ\\x01\\x02)" },
+        { 'Y','Z',0x05,0x06, "YZ EOCD                   (YZ\\x05\\x06)" },
+        { 'P','K',0x03,0x04, "PK ローカルファイルヘッダ (PK\\x03\\x04)" },
+        { 'P','K',0x01,0x02, "PK セントラルディレクトリ  (PK\\x01\\x02)" },
+        { 'P','K',0x05,0x06, "PK EOCD                   (PK\\x05\\x06)" },
+    };
+
+    std::cout << "--- シグネチャ出現位置スキャン ---\n";
+    for (const auto& s : sigs) {
+        std::vector<size_t> positions;
+        for (size_t i = 0; i + 3 < buf.size(); ++i) {
+            if (buf[i]==s.b0 && buf[i+1]==s.b1 && buf[i+2]==s.b2 && buf[i+3]==s.b3)
+                positions.push_back(i);
+        }
+        std::cout << s.name << ": ";
+        if (positions.empty()) {
+            std::cout << "なし\n";
+        } else {
+            std::cout << positions.size() << " 件\n";
+            for (size_t p : positions) {
+                std::cout << "  offset 0x" << std::hex << std::uppercase << p
+                          << " (" << std::dec << p << ")\n";
+            }
+        }
+    }
+    std::cout << "\n";
+
+    // ── EOCD候補の詳細検証 ────────────────────────────────────
+    std::cout << "--- EOCD 候補の検証 ---\n";
+    struct EocdSig { uint8_t b0, b1; const char* label; };
+    EocdSig eocd_sigs[] = { {'Y','Z',"YZ"}, {'P','K',"PK"} };
+
+    bool any_eocd = false;
+    for (const auto& es : eocd_sigs) {
+        for (size_t i = 0; i + 3 < buf.size(); ++i) {
+            if (buf[i]==es.b0 && buf[i+1]==es.b1 && buf[i+2]==0x05 && buf[i+3]==0x06) {
+                any_eocd = true;
+                uint16_t comment_len = (i + ZIP_EOCD_COMMENT_LEN + 1 < buf.size())
+                    ? read_le16(buf.data() + i + ZIP_EOCD_COMMENT_LEN) : 0xFFFF;
+                size_t expected_end = i + ZIP_EOCD_FIXED_SIZE + comment_len;
+                bool valid = (expected_end == buf.size());
+
+                std::cout << es.label << " EOCD at offset 0x"
+                          << std::hex << std::uppercase << i
+                          << " (" << std::dec << i << "):\n";
+                std::cout << "  comment_len フィールド = " << comment_len << "\n";
+                std::cout << "  期待するファイル末尾位置 = "
+                          << expected_end << " (実際 = " << buf.size() << ")\n";
+                std::cout << "  検証: " << (valid ? "OK (有効)" : "NG (末尾と不一致)") << "\n";
+                if (!valid) {
+                    std::cout << "  ずれ = "
+                              << static_cast<long long>(expected_end)
+                                 - static_cast<long long>(buf.size())
+                              << " バイト\n";
+                }
+                // EOCDフィールドの内容も表示
+                if (i + ZIP_EOCD_FIXED_SIZE <= buf.size()) {
+                    uint16_t disk_num      = read_le16(buf.data() + i + 4);
+                    uint16_t cd_disk       = read_le16(buf.data() + i + 6);
+                    uint16_t cd_entries_on_disk = read_le16(buf.data() + i + 8);
+                    uint16_t cd_entries_total   = read_le16(buf.data() + i + 10);
+                    uint32_t cd_size       = read_le32(buf.data() + i + 12);
+                    uint32_t cd_offset     = read_le32(buf.data() + i + 16);
+                    std::cout << "  ディスク番号=" << disk_num
+                              << " CDディスク=" << cd_disk
+                              << " エントリ(このディスク)=" << cd_entries_on_disk
+                              << " エントリ(合計)=" << cd_entries_total << "\n";
+                    std::cout << "  CDサイズ=0x" << std::hex << cd_size
+                              << " CDオフセット=0x" << cd_offset << "\n" << std::dec;
+                }
+                std::cout << "\n";
+            }
+        }
+    }
+    if (!any_eocd) {
+        std::cout << "EOCD シグネチャが一切見つかりませんでした。\n"
+                  << "ファイルが破損しているか、全く異なるフォーマットの可能性があります。\n\n";
+    }
+
+    std::cout << "=== 診断終了 ===\n";
 }

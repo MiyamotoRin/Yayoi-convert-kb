@@ -34,14 +34,17 @@ static void print_usage(const char* prog) {
         << "\n"
         << "使い方:\n"
         << "  " << prog << " <input.KB12> [output.KB26]\n"
+        << "  " << prog << " --diagnose <input.KB12>\n"
         << "\n"
         << "引数:\n"
-        << "  input.KB12   変換元バックアップファイル\n"
-        << "  output.KB26  変換先ファイル (省略時: 入力ファイルと同ディレクトリに .KB26 で生成)\n"
+        << "  input.KB12    変換元バックアップファイル\n"
+        << "  output.KB26   変換先ファイル (省略時: 入力ファイルと同ディレクトリに .KB26 で生成)\n"
+        << "  --diagnose    変換を行わず、ファイル内部構造の詳細診断のみ行う\n"
         << "\n"
         << "例:\n"
         << "  " << prog << " 会社データ.KB12\n"
-        << "  " << prog << " 会社データ.KB12 会社データ.KB26\n";
+        << "  " << prog << " 会社データ.KB12 会社データ.KB26\n"
+        << "  " << prog << " --diagnose 会社データ.KB12\n";
 }
 
 /**
@@ -84,6 +87,14 @@ int main(int argc, char* argv[]) {
     std::string input_path  = argv[1];
     std::string output_path = (argc >= 3) ? argv[2] : make_output_path(input_path);
 #endif
+
+    // ── --diagnose モード ────────────────────────────────────
+    // "kb_converter --diagnose <file>" の形式で呼ばれた場合、
+    // input_path == "--diagnose"、output_path == 対象ファイルパス になる
+    if (input_path == "--diagnose") {
+        diagnose_kb_file(output_path);
+        return 0;
+    }
 
     std::cout << "入力ファイル : " << input_path  << "\n"
               << "出力ファイル : " << output_path << "\n"

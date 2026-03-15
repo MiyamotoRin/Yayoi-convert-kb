@@ -67,3 +67,12 @@ bool validate_kb12_file(const std::string& file_path, std::string* error_msg = n
  * @return バージョン番号 (取得失敗時は0)
  */
 uint16_t get_kb_file_version(const std::string& file_path);
+
+/**
+ * ファイルの内部構造を診断して標準出力に詳細を表示する。
+ * 問題の原因調査用。先頭/末尾のバイト列、シグネチャ出現位置、
+ * EOCD候補の検証結果などを出力する。
+ *
+ * @param file_path  診断対象ファイルパス
+ */
+void diagnose_kb_file(const std::string& file_path);
