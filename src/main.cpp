@@ -13,12 +13,9 @@
 
 #include <iostream>
 #include <string>
-#include <filesystem>
 #ifdef _WIN32
 #  include <windows.h>
 #endif
-
-namespace fs = std::filesystem;
 
 static void print_usage(const char* prog) {
     std::cerr
@@ -37,15 +34,18 @@ static void print_usage(const char* prog) {
 }
 
 /**
- * 入力パスの拡張子を .KB26 に変えた出力パスを返す
+ * 入力パスの拡張子を .KB26 に変えた出力パスを返す。
+ * std::filesystem を一切使わず純粋な文字列操作で行う。
+ * (MinGW の std::filesystem はロケール変換時に日本語パスで例外を投げるため)
  */
 static std::string make_output_path(const std::string& input_path) {
-    // argv[] は UTF-8 (Git Bash / MSYS2) なので u8path で構築し、
-    // p.string() は Windows の ANSI コードページ変換で日本語パスが
-    // "Illegal byte sequence" になるため u8string() で返す。
-    fs::path p = fs::u8path(input_path);
-    p.replace_extension(".KB26");
-    return p.u8string();
+    size_t sep = input_path.find_last_of("/\\");
+    size_t dot = input_path.rfind('.');
+    if (dot != std::string::npos &&
+        (sep == std::string::npos || dot > sep)) {
+        return input_path.substr(0, dot) + ".KB26";
+    }
+    return input_path + ".KB26";
 }
 
 int main(int argc, char* argv[]) {

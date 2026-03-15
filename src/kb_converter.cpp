@@ -33,8 +33,7 @@
 #include "kb_converter.h"
 #include "kb_format.h"
 
-#include <fstream>
-#include <sstream>
+#include <cstdio>
 #include <cstring>
 #include <algorithm>
 #include <cctype>
@@ -71,29 +70,33 @@ static inline uint32_t read_le32(const uint8_t* p) {
 }
 
 static bool read_file(const std::string& path, std::vector<uint8_t>& buf) {
-    // Windows では日本語パスが ANSI として解釈されるため wstring 版を使用する
+    // std::ifstream は Windows ANSI パスとして解釈するため _wfopen を使用する
 #ifdef _WIN32
-    std::ifstream ifs(utf8_to_wstring(path).c_str(), std::ios::binary | std::ios::ate);
+    FILE* f = _wfopen(utf8_to_wstring(path).c_str(), L"rb");
 #else
-    std::ifstream ifs(path, std::ios::binary | std::ios::ate);
+    FILE* f = std::fopen(path.c_str(), "rb");
 #endif
-    if (!ifs) return false;
-    std::streamsize size = ifs.tellg();
-    if (size <= 0) return false;
-    ifs.seekg(0, std::ios::beg);
+    if (!f) return false;
+    std::fseek(f, 0, SEEK_END);
+    long size = std::ftell(f);
+    if (size <= 0) { std::fclose(f); return false; }
+    std::fseek(f, 0, SEEK_SET);
     buf.resize(static_cast<size_t>(size));
-    return static_cast<bool>(ifs.read(reinterpret_cast<char*>(buf.data()), size));
+    bool ok = (std::fread(buf.data(), 1, buf.size(), f) == buf.size());
+    std::fclose(f);
+    return ok;
 }
 
 static bool write_file(const std::string& path, const std::vector<uint8_t>& buf) {
 #ifdef _WIN32
-    std::ofstream ofs(utf8_to_wstring(path).c_str(), std::ios::binary | std::ios::trunc);
+    FILE* f = _wfopen(utf8_to_wstring(path).c_str(), L"wb");
 #else
-    std::ofstream ofs(path, std::ios::binary | std::ios::trunc);
+    FILE* f = std::fopen(path.c_str(), "wb");
 #endif
-    if (!ofs) return false;
-    return static_cast<bool>(ofs.write(reinterpret_cast<const char*>(buf.data()),
-                                       static_cast<std::streamsize>(buf.size())));
+    if (!f) return false;
+    bool ok = (std::fwrite(buf.data(), 1, buf.size(), f) == buf.size());
+    std::fclose(f);
+    return ok;
 }
 
 // ─────────────────────────────────────────────
@@ -275,10 +278,11 @@ ConvertResult convert_kb12_to_kb26(
     std::vector<uint8_t> buf;
     if (!read_file(input_path, buf)) {
 #ifdef _WIN32
-        std::ifstream test(utf8_to_wstring(input_path).c_str());
+        FILE* test = _wfopen(utf8_to_wstring(input_path).c_str(), L"rb");
 #else
-        std::ifstream test(input_path);
+        FILE* test = std::fopen(input_path.c_str(), "rb");
 #endif
+        if (test) std::fclose(test);
         return test ? ConvertResult::ERR_INPUT_READ_FAILED
                     : ConvertResult::ERR_INPUT_NOT_FOUND;
     }
@@ -395,10 +399,11 @@ bool validate_kb12_file(const std::string& file_path, std::string* error_msg) {
     std::vector<uint8_t> buf;
     if (!read_file(file_path, buf)) {
 #ifdef _WIN32
-        std::ifstream test(utf8_to_wstring(file_path).c_str());
+        FILE* test = _wfopen(utf8_to_wstring(file_path).c_str(), L"rb");
 #else
-        std::ifstream test(file_path);
+        FILE* test = std::fopen(file_path.c_str(), "rb");
 #endif
+        if (test) std::fclose(test);
         return test ? set_err("ファイルの読み込みに失敗しました")
                     : set_err("ファイルが見つかりません: " + file_path);
     }
