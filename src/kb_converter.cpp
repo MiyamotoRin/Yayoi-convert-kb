@@ -43,6 +43,7 @@
 #ifdef _WIN32
 #  include <windows.h>
 #endif
+#include <zlib.h>
 
 // ─────────────────────────────────────────────
 // ユーティリティ
@@ -70,6 +71,325 @@ static inline uint32_t read_le32(const uint8_t* p) {
          | (static_cast<uint32_t>(p[1]) << 8)
          | (static_cast<uint32_t>(p[2]) << 16)
          | (static_cast<uint32_t>(p[3]) << 24);
+}
+
+static inline uint64_t read_le64(const uint8_t* p) {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; ++i) v |= static_cast<uint64_t>(p[i]) << (8 * i);
+    return v;
+}
+
+static inline void write_le16(uint8_t* p, uint16_t v) {
+    p[0] = static_cast<uint8_t>(v & 0xFF);
+    p[1] = static_cast<uint8_t>((v >> 8) & 0xFF);
+}
+
+static inline void write_le32(uint8_t* p, uint32_t v) {
+    for (int i = 0; i < 4; ++i) { p[i] = static_cast<uint8_t>(v & 0xFF); v >>= 8; }
+}
+
+static inline void write_le64(uint8_t* p, uint64_t v) {
+    for (int i = 0; i < 8; ++i) { p[i] = static_cast<uint8_t>(v & 0xFF); v >>= 8; }
+}
+
+// ─────────────────────────────────────────────
+// Jet 4.0 MDB 内の SystemInfo テーブル DataVersion パッチ
+// ─────────────────────────────────────────────
+
+/**
+ * Jet 4.0 MDB バイナリ内の SystemInfo テーブルを探し、
+ * Id=1 の行の DataVersion を 3600 に更新し、
+ * 弥生26が必要とする追加行 (Id=5,6,9,10,11) を挿入する。
+ *
+ * SystemInfo テーブルの識別:
+ *   TDEF ページ (type=0x02) 内に UTF-16LE の "DataVersion" 列名が含まれる。
+ *
+ * 行レイアウト (27バイト固定):
+ *   [0-1]  : 行フラグ (0x05 0x00)
+ *   [2-5]  : Id (Int32 LE)
+ *   [6-9]  : DataVersion (Int32 LE)
+ *   [10-13]: DataStatus (Int32 LE)
+ *   [14-17]: ShoushinStatus (Int32 LE)
+ *   [18-25]: RecTimeStamp (Double LE)
+ *   [26]   : ヌルビットマップ (0x1F)
+ *
+ * Jet 4.0 データページ:
+ *   行データはページ末尾から下方向に成長し、行オフセットテーブルは
+ *   ページ先頭のヘッダ (14バイト) の直後に上方向に成長する。
+ */
+static bool patch_mdb_sysinfo_version(std::vector<uint8_t>& mdb,
+                                       ProgressCallback notify)
+{
+    static constexpr int32_t  TARGET_DATA_VERSION = 3600; // 0x0E10
+    static constexpr size_t   JET_PAGE_SIZE       = 4096;
+    static constexpr size_t   ROW_SIZE            = 27;   // 固定長行サイズ
+
+    // 弥生26の実KD26ファイルに存在する追加 SystemInfo 行
+    struct RequiredRow { int32_t id; int32_t data_version; };
+    static constexpr RequiredRow REQUIRED_ROWS[] = {
+        {  5, 3200 },  // サブシステムバージョン
+        {  6,   13 },  // カウンター
+        {  9, 3400 },  // サブシステムバージョン
+        { 10, 3200 },  // サブシステムバージョン
+        { 11, 3004 },  // サブシステムバージョン
+    };
+
+    if (mdb.size() < JET_PAGE_SIZE || mdb.size() % JET_PAGE_SIZE != 0) return false;
+    const size_t num_pages = mdb.size() / JET_PAGE_SIZE;
+
+    // UTF-16LE "DataVersion" (22バイト)
+    static const uint8_t DATA_VERSION_UTF16[] = {
+        0x44,0x00,0x61,0x00,0x74,0x00,0x61,0x00,
+        0x56,0x00,0x65,0x00,0x72,0x00,0x73,0x00,
+        0x69,0x00,0x6f,0x00,0x6e,0x00
+    };
+    static constexpr size_t DV_UTF16_LEN = sizeof(DATA_VERSION_UTF16);
+
+    // ── Step A: "DataVersion" 列を持つ TDEF ページを探す ─────────
+    uint32_t sysinfo_tdef = 0;
+    for (size_t pg = 0; pg < num_pages && !sysinfo_tdef; ++pg) {
+        const uint8_t* base = mdb.data() + pg * JET_PAGE_SIZE;
+        if (base[0] != 0x02) continue; // TDEF ページのみ
+        for (size_t i = 0x50; i + DV_UTF16_LEN <= JET_PAGE_SIZE; ++i) {
+            if (std::memcmp(base + i, DATA_VERSION_UTF16, DV_UTF16_LEN) == 0) {
+                sysinfo_tdef = static_cast<uint32_t>(pg);
+                break;
+            }
+        }
+    }
+    if (!sysinfo_tdef) {
+        if (notify) notify("  [警告] SystemInfo TDEF が見つかりません", -1);
+        return false;
+    }
+    if (notify) notify("  SystemInfo TDEF: page=" + std::to_string(sysinfo_tdef), -1);
+
+    // ── Step B: owner=sysinfo_tdef のデータページを探す ──────────
+    bool patched = false;
+    for (size_t pg = 0; pg < num_pages; ++pg) {
+        uint8_t* base = mdb.data() + pg * JET_PAGE_SIZE;
+        if (base[0] != 0x01) continue; // データページのみ
+        const uint32_t owner = read_le32(base + 4);
+        if (owner != sysinfo_tdef) continue;
+
+        uint16_t row_count = read_le16(base + 12);
+
+        // ── Step B-1: 既存行の Id を収集し、Id=1 を更新 ────────
+        // RecTimeStamp を Id=1 行からコピーして新規行に流用する
+        uint8_t rec_timestamp[8] = {};
+        bool has_ids[256] = {};  // 簡易: Id < 256 を想定
+        for (uint16_t r = 0; r < row_count && r < 100; ++r) {
+            const uint16_t row_off = read_le16(base + 14 + r * 2);
+            if (row_off < 10 || row_off >= JET_PAGE_SIZE) continue;
+
+            uint8_t* row = base + row_off;
+            if (pg * JET_PAGE_SIZE + row_off + ROW_SIZE > mdb.size()) continue;
+
+            const int32_t id = static_cast<int32_t>(read_le32(row + 2));
+            if (id >= 0 && id < 256) has_ids[id] = true;
+
+            if (id == 1) {
+                const int32_t dv = static_cast<int32_t>(read_le32(row + 6));
+                if (notify) {
+                    notify("  SystemInfo Id=1 DataVersion: "
+                           + std::to_string(dv) + " -> "
+                           + std::to_string(TARGET_DATA_VERSION), -1);
+                }
+                write_le32(row + 6, static_cast<uint32_t>(TARGET_DATA_VERSION));
+                std::memcpy(rec_timestamp, row + 18, 8);
+                patched = true;
+            }
+        }
+
+        // ── Step B-2: 不足行を追加 ───────────────────────────────
+        // 行データはページ末尾から下方向に成長する
+        // 現在の最下位行オフセットを求める
+        uint16_t min_row_off = static_cast<uint16_t>(JET_PAGE_SIZE);
+        for (uint16_t r = 0; r < row_count && r < 100; ++r) {
+            const uint16_t off = read_le16(base + 14 + r * 2);
+            if (off > 0 && off < min_row_off) min_row_off = off;
+        }
+
+        uint16_t rows_added = 0;
+        for (const auto& req : REQUIRED_ROWS) {
+            if (req.id >= 0 && req.id < 256 && has_ids[req.id]) continue;
+
+            // 新規行の配置位置
+            const uint16_t new_row_off = min_row_off - static_cast<uint16_t>(ROW_SIZE);
+
+            // オフセットテーブル末尾 = 14 + (row_count + rows_added + 1) * 2
+            // 行データはそれより下にある必要がある
+            const size_t offset_table_end = 14 + (static_cast<size_t>(row_count)
+                                            + rows_added + 1) * 2;
+            if (new_row_off < offset_table_end) {
+                if (notify) notify("  [警告] ページ空き不足、行追加中断", -1);
+                break;
+            }
+
+            // 行データを書き込み
+            uint8_t* row = base + new_row_off;
+            row[0] = 0x05; row[1] = 0x00;                            // flags
+            write_le32(row + 2,  static_cast<uint32_t>(req.id));      // Id
+            write_le32(row + 6,  static_cast<uint32_t>(req.data_version)); // DataVersion
+            write_le32(row + 10, 0);                                  // DataStatus
+            write_le32(row + 14, 0);                                  // ShoushinStatus
+            std::memcpy(row + 18, rec_timestamp, 8);                  // RecTimeStamp
+            row[26] = 0x1F;                                           // null bitmap
+
+            // オフセットテーブルに追加
+            const uint16_t slot = row_count + rows_added;
+            write_le16(base + 14 + slot * 2, new_row_off);
+
+            min_row_off = new_row_off;
+            rows_added++;
+
+            if (notify) {
+                notify("  SystemInfo Id=" + std::to_string(req.id)
+                       + " 追加 (DataVersion=" + std::to_string(req.data_version) + ")", -1);
+            }
+        }
+
+        // データページの行数と空き領域を更新
+        if (rows_added > 0) {
+            const uint16_t new_row_count = row_count + rows_added;
+            write_le16(base + 12, new_row_count);
+
+            // 空き領域 = 最下位行オフセット - (ヘッダ14バイト + オフセットテーブル)
+            const uint16_t free_space = min_row_off
+                - static_cast<uint16_t>(14 + new_row_count * 2);
+            write_le16(base + 2, free_space);
+
+            patched = true;
+        }
+    }
+
+    // ── Step C: TDEF ページの行カウントを更新 ──────────────────
+    // Jet 4.0 TDEF ヘッダのオフセット 16-19 にテーブルの総行数が格納される
+    if (patched) {
+        uint8_t* tdef_base = mdb.data() + sysinfo_tdef * JET_PAGE_SIZE;
+        const uint32_t old_tdef_rows = read_le32(tdef_base + 16);
+        // データページの行数合計を TDEF に反映
+        uint32_t total_rows = 0;
+        for (size_t pg = 0; pg < num_pages; ++pg) {
+            const uint8_t* dp = mdb.data() + pg * JET_PAGE_SIZE;
+            if (dp[0] != 0x01) continue;
+            if (read_le32(dp + 4) != sysinfo_tdef) continue;
+            total_rows += read_le16(dp + 12);
+        }
+        write_le32(tdef_base + 16, total_rows);
+        if (notify) {
+            notify("  TDEF 行カウント更新: "
+                   + std::to_string(old_tdef_rows) + " -> "
+                   + std::to_string(total_rows), -1);
+        }
+    }
+    return patched;
+}
+
+// ─────────────────────────────────────────────
+// KD エントリの展開・パッチ・再圧縮
+// ─────────────────────────────────────────────
+
+/**
+ * KB バッファ内の KD エントリ (Jet 4.0 MDB, deflate 圧縮) を展開し、
+ * SystemInfo.DataVersion をパッチして再圧縮する。
+ * 圧縮後サイズが変化した場合はバッファを伸縮し、LFH/CDE/EOCD を更新する。
+ */
+static ConvertResult patch_kd_entry(
+    std::vector<uint8_t>& buf,
+    size_t lfh_offset,      // ローカルファイルヘッダの先頭位置
+    size_t data_offset,     // 圧縮データの先頭位置 (= lfh + 38 + name + extra)
+    uint64_t comp_size,     // 圧縮後サイズ
+    uint64_t uncomp_size,   // 展開後サイズ
+    size_t cde_offset,      // セントラルディレクトリエントリの位置
+    size_t eocd_offset,     // EOCD の位置
+    ProgressCallback notify)
+{
+    if (data_offset + comp_size > buf.size()) return ConvertResult::ERR_TRUNCATED_FILE;
+
+    // ── 1. 展開 ─────────────────────────────────────────────────
+    notify("  KD データを展開しています...", 62);
+    std::vector<uint8_t> mdb(uncomp_size);
+    {
+        z_stream zs{};
+        zs.next_in  = buf.data() + data_offset;
+        zs.avail_in = static_cast<uInt>(comp_size);
+        zs.next_out = mdb.data();
+        zs.avail_out= static_cast<uInt>(uncomp_size);
+        if (inflateInit2(&zs, -15) != Z_OK)
+            return ConvertResult::ERR_UNSUPPORTED_FEATURE;
+        const int ret = inflate(&zs, Z_FINISH);
+        inflateEnd(&zs);
+        if (ret != Z_STREAM_END)
+            return ConvertResult::ERR_UNSUPPORTED_FEATURE;
+        mdb.resize(zs.total_out);
+    }
+    notify("  展開完了: " + std::to_string(mdb.size()) + " bytes", 65);
+
+    // ── 2. MDB パッチ ────────────────────────────────────────────
+    notify("  SystemInfo DataVersion を更新しています...", 70);
+    if (!patch_mdb_sysinfo_version(mdb, notify)) {
+        notify("  [情報] DataVersion の更新対象が見つかりませんでした (既に最新の可能性)", -1);
+        // 更新不要でもエラーにはしない
+    }
+
+    // ── 3. CRC-32 計算 ─────────────────────────────────────────
+    const uint32_t new_crc = static_cast<uint32_t>(
+        crc32(0, mdb.data(), static_cast<uInt>(mdb.size())));
+
+    // ── 4. 再圧縮 ───────────────────────────────────────────────
+    notify("  KD データを再圧縮しています...", 75);
+    std::vector<uint8_t> compressed;
+    {
+        compressed.resize(static_cast<size_t>(compressBound(static_cast<uLong>(mdb.size()))));
+
+        z_stream zs{};
+        if (deflateInit2(&zs, Z_DEFAULT_COMPRESSION, Z_DEFLATED,
+                         -15, 8, Z_DEFAULT_STRATEGY) != Z_OK)
+            return ConvertResult::ERR_UNSUPPORTED_FEATURE;
+        zs.next_in  = mdb.data();
+        zs.avail_in = static_cast<uInt>(mdb.size());
+        zs.next_out = compressed.data();
+        zs.avail_out= static_cast<uInt>(compressed.size());
+        const int ret = deflate(&zs, Z_FINISH);
+        deflateEnd(&zs);
+        if (ret != Z_STREAM_END)
+            return ConvertResult::ERR_UNSUPPORTED_FEATURE;
+        compressed.resize(zs.total_out);
+    }
+    notify("  再圧縮完了: " + std::to_string(compressed.size()) + " bytes", 80);
+
+    const uint64_t new_comp_size = compressed.size();
+    const int64_t  delta = static_cast<int64_t>(new_comp_size)
+                         - static_cast<int64_t>(comp_size);
+
+    // ── 5. バッファ内の圧縮データを差し替え ────────────────────
+    buf.erase(buf.begin() + static_cast<std::ptrdiff_t>(data_offset),
+              buf.begin() + static_cast<std::ptrdiff_t>(data_offset + comp_size));
+    buf.insert(buf.begin() + static_cast<std::ptrdiff_t>(data_offset),
+               compressed.begin(), compressed.end());
+
+    // ── 6. LFH の CRC-32 と comp_size を更新 ─────────────────
+    write_le32(buf.data() + lfh_offset + ZIP_LFH_CRC32,           new_crc);
+    write_le64(buf.data() + lfh_offset + ZIP_LFH_COMPRESSED_SIZE, new_comp_size);
+    // uncomp_size は変化しないので ZIP_LFH_UNCOMPRESSED_SIZE は更新不要
+
+    // ── 7. CDE の CRC-32 と comp_size を更新 ────────────────
+    // delta 分だけ CDE のオフセットが変化する
+    const size_t new_cde_offset = static_cast<size_t>(
+        static_cast<int64_t>(cde_offset) + delta);
+    // CDE: CRC-32 は +16, comp_size は ZIP_CDE_COMPRESSED_SIZE (+20)
+    write_le32(buf.data() + new_cde_offset + 16,                    new_crc);
+    write_le64(buf.data() + new_cde_offset + ZIP_CDE_COMPRESSED_SIZE, new_comp_size);
+
+    // ── 8. EOCD の CD オフセットを更新 ────────────────────────
+    const size_t new_eocd_offset = static_cast<size_t>(
+        static_cast<int64_t>(eocd_offset) + delta);
+    write_le32(buf.data() + new_eocd_offset + ZIP_EOCD_CD_OFFSET,
+               static_cast<uint32_t>(new_cde_offset));
+
+    notify("  KD パッチ完了 (圧縮サイズ変化: "
+           + std::string(delta >= 0 ? "+" : "") + std::to_string(delta) + " bytes)", 85);
+    return ConvertResult::SUCCESS;
 }
 
 static bool read_file(const std::string& path, std::vector<uint8_t>& buf) {
@@ -434,6 +754,54 @@ ConvertResult convert_kb12_to_kb26(
         // バージョン文字列が見つからなかった場合
         // 圧縮データ内に格納されている可能性があるため調査が必要
         return ConvertResult::ERR_UNSUPPORTED_FEATURE;
+    }
+
+    // ── Step 5e: KD データ内の MDB (SystemInfo.DataVersion) を更新 ──
+    // KB ファイルの唯一のエントリ (KD ファイル) を展開・パッチ・再圧縮する。
+    notify("KD データベース内バージョン情報を更新しています...", 60);
+    {
+        // KD エントリを探す: 名前が ".KD12" または ".KD26" で終わるもの
+        for (const auto& e : entries) {
+            const std::string& name = e.name;
+            // ".KD12" → ".KD26" は既に Step 5a でパッチ済みなので ".KD26" か ".KD12" を確認
+            bool is_kd = (name.size() >= 5 &&
+                          (name.substr(name.size() - 5) == ".KD26" ||
+                           name.substr(name.size() - 5) == ".KD12"));
+            if (!is_kd) continue;
+
+            const size_t lfh = e.local_offset;
+            if (lfh + ZIP_LFH_FIXED_SIZE > buf.size()) continue;
+
+            const uint64_t entry_comp_size   = read_le64(buf.data() + lfh + ZIP_LFH_COMPRESSED_SIZE);
+            const uint64_t entry_uncomp_size = read_le64(buf.data() + lfh + ZIP_LFH_UNCOMPRESSED_SIZE);
+            const uint16_t lfh_name_len      = read_le16(buf.data() + lfh + ZIP_LFH_FILENAME_LEN);
+            const uint16_t lfh_extra_len     = read_le16(buf.data() + lfh + ZIP_LFH_EXTRA_LEN);
+            const size_t   data_off          = lfh + ZIP_LFH_FIXED_SIZE + lfh_name_len + lfh_extra_len;
+
+            // 圧縮サイズの妥当性確認
+            if (entry_uncomp_size == 0 || entry_comp_size == 0) continue;
+            if (data_off + entry_comp_size > buf.size()) continue;
+            // KD ファイルは Jet 4.0 MDB (4096 バイトページ); 展開サイズがその倍数か確認
+            if (entry_uncomp_size % 4096 != 0) continue;
+
+            notify("  KD エントリ: \"" + name + "\""
+                   " comp=" + std::to_string(entry_comp_size)
+                   + " uncomp=" + std::to_string(entry_uncomp_size), -1);
+
+            const ConvertResult kd_result = patch_kd_entry(
+                buf,
+                lfh, data_off,
+                entry_comp_size, entry_uncomp_size,
+                e.cd_offset, eocd_offset,
+                notify);
+
+            if (kd_result != ConvertResult::SUCCESS) {
+                notify("  [警告] KD データのパッチに失敗しました (コード="
+                       + std::string(convert_result_to_string(kd_result)) + ")", -1);
+                // 失敗してもコンテナ変換は成功とする
+            }
+            break; // KD エントリは1つのみ
+        }
     }
 
     // ── Step 6: 書き出し ─────────────────────────────────────

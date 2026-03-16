@@ -99,6 +99,20 @@ int main(int argc, char** argv) {
     out.resize(uncomp_len);
     printf("展開完了: %llu バイト\n", (unsigned long long)uncomp_len);
 
+    // 展開したデータをファイルに書き出す (argc >= 3 の場合)
+    if (argc >= 3) {
+#ifdef _WIN32
+        FILE* fout = _wfopen(utf8_to_wstring(argv[2]).c_str(), L"wb");
+#else
+        FILE* fout = fopen(argv[2], "wb");
+#endif
+        if (fout) {
+            fwrite(out.data(), 1, out.size(), fout);
+            fclose(fout);
+            printf("KD データを書き出しました: %s\n", argv[2]);
+        }
+    }
+
     // 先頭16バイトを hex 表示
     printf("先頭 16 バイト: ");
     for (size_t i = 0; i < std::min<size_t>(16, out.size()); i++)

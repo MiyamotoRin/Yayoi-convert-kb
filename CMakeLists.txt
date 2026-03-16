@@ -38,6 +38,15 @@ add_executable(kb_converter
 )
 
 target_include_directories(kb_converter PRIVATE src)
+target_link_libraries(kb_converter PRIVATE z)
+
+add_executable(find_version
+    src/find_version.cpp
+)
+
+add_executable(parse_sysinfo
+    src/parse_sysinfo.cpp
+)
 
 # C++17 の std::filesystem リンク (GCC < 9 では明示的に指定が必要)
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS "9.0")
